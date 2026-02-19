@@ -113,6 +113,33 @@ CITIES = {
     },
 }
 
+PRECIPITATION_CITIES = {
+    "nyc": {
+        "slug_pattern": "precipitation-in-nyc-in-{month_lower}",
+        "lat": 40.7128,
+        "lon": -74.0060,
+        "unit": "inch",
+        "timezone": "America/New_York",
+    },
+    "seattle": {
+        "slug_pattern": "precipitation-in-seattle-in-{month_lower}",
+        "lat": 47.6062,
+        "lon": -122.3321,
+        "unit": "inch",
+        "timezone": "America/Los_Angeles",
+    },
+}
+
+CLIMATE_EVENT_SLUGS = [
+    "february-2026-temperature-increase-c",
+    "will-a-hurricane-form-by-may-31",
+    "where-will-2026-rank-among-the-hottest-years-on-record",
+    "how-many-7-0-or-above-earthquakes-by-june-30",
+    "how-many-6-5-or-above-earthquakes-february-16-february-22",
+    "2026-february-1st-2nd-3rd-hottest-on-record",
+    "10-0-or-above-earthquake-before-2027",
+]
+
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"

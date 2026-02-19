@@ -20,8 +20,9 @@ def fetch_hourly_forecast(
     params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": "temperature_2m",
+        "hourly": "temperature_2m,precipitation",
         "temperature_unit": unit,
+        "precipitation_unit": "inch",
         "timezone": timezone,
         "forecast_days": forecast_days,
     }
@@ -32,6 +33,56 @@ def fetch_hourly_forecast(
     except requests.RequestException as exc:
         logger.error("Open-Meteo request failed: %s", exc)
         return None
+
+
+def fetch_monthly_precipitation(
+    lat: float,
+    lon: float,
+    timezone_str: str,
+    year: int,
+    month: int,
+) -> Optional[dict]:
+    from datetime import date
+    import calendar
+    last_day = calendar.monthrange(year, month)[1]
+    start_date = date(year, month, 1).isoformat()
+    end_date = date(year, month, last_day).isoformat()
+    today = date.today()
+
+    if date(year, month, last_day) <= today:
+        base_url = "https://archive-api.open-meteo.com/v1/archive"
+    else:
+        base_url = OPEN_METEO_URL
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "precipitation_sum",
+        "precipitation_unit": "inch",
+        "timezone": timezone_str,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    try:
+        resp = requests.get(base_url, params=params, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        logger.error("Open-Meteo precipitation request failed: %s", exc)
+        return None
+
+
+def estimate_monthly_precipitation(
+    daily_data: dict,
+) -> Optional[float]:
+    daily = daily_data.get("daily", {})
+    precip_values = daily.get("precipitation_sum", [])
+    if not precip_values:
+        return None
+    valid = [p for p in precip_values if p is not None]
+    if not valid:
+        return None
+    return sum(valid)
 
 
 def get_daily_max_from_hourly(hourly_data: dict, target_date: str) -> Optional[float]:
@@ -88,6 +139,44 @@ def estimate_bucket_probability(
         if bucket_low is not None and rounded < bucket_low:
             in_bucket = False
         if bucket_high is not None and rounded > bucket_high:
+            in_bucket = False
+        if in_bucket:
+            hits += 1
+    return hits / n_simulations
+
+
+def parse_precipitation_range(question: str) -> tuple[Optional[float], Optional[float]]:
+    question = question.lower()
+    m = re.search(r'less than (\d+)', question)
+    if m:
+        return None, float(m.group(1))
+    m = re.search(r'more than (\d+)', question)
+    if m:
+        return float(m.group(1)), None
+    m = re.search(r'between (\d+) and (\d+)', question)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    return None, None
+
+
+def estimate_precipitation_probability(
+    forecast_total: float,
+    bucket_low: Optional[float],
+    bucket_high: Optional[float],
+    std_dev: float = 0.8,
+    n_simulations: int = 5000,
+) -> float:
+    import random
+
+    hits = 0
+    for _ in range(n_simulations):
+        simulated = forecast_total + random.gauss(0, std_dev)
+        if simulated < 0:
+            simulated = 0
+        in_bucket = True
+        if bucket_low is not None and simulated < bucket_low:
+            in_bucket = False
+        if bucket_high is not None and simulated > bucket_high:
             in_bucket = False
         if in_bucket:
             hits += 1
