@@ -1,5 +1,6 @@
 import logging
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from config import (
@@ -7,7 +8,7 @@ from config import (
     PRECIPITATION_CITIES,
     EDGE_THRESHOLD,
     MIN_LIQUIDITY,
-    FORECAST_DAYS,
+    SCAN_INTERVAL_SECONDS,
 )
 from weather_forecast import (
     fetch_hourly_forecast,
@@ -22,6 +23,16 @@ from opportunity_detector import (
     analyze_precipitation_event,
     Opportunity,
 )
+from paper_trader import (
+    load_portfolio,
+    save_portfolio,
+    place_paper_bet,
+    get_portfolio_summary,
+    resolve_bet,
+    MAX_BETS_PER_SCAN,
+)
+from bet_resolver import try_resolve_bet
+import telegram_bot as tg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,44 +42,59 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SEPARATOR = "=" * 80
+DAYS_AHEAD = 2
 
 
-def run_scan() -> list[Opportunity]:
+def run_resolve_cycle() -> list[dict]:
+    portfolio = load_portfolio()
+    resolved = []
+
+    if not portfolio.active_bets:
+        return resolved
+
+    logger.info("Checking %d active bets for resolution...", len(portfolio.active_bets))
+    bets_to_check = list(portfolio.active_bets)
+
+    for bet in bets_to_check:
+        result = try_resolve_bet(bet)
+        if result is not None:
+            resolve_bet(portfolio, bet, won=result)
+            resolved.append(bet)
+            tg.send_message(tg.format_bet_resolved(bet))
+            time.sleep(0.5)
+
+    if resolved:
+        save_portfolio(portfolio)
+        logger.info("Resolved %d bets", len(resolved))
+
+    return resolved
+
+
+def run_scan() -> tuple[list[Opportunity], list[dict]]:
     logger.info(SEPARATOR)
-    logger.info("POLYMARKET WEATHER BOT v2 - UNIVERSAL SCANNER (DRY RUN)")
+    logger.info("POLYMARKET WEATHER BOT v3 - AUTO PAPER TRADER")
     logger.info("Scan time: %s UTC", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
     logger.info(SEPARATOR)
 
-    events = discover_all_weather_events(days_ahead=FORECAST_DAYS)
+    events = discover_all_weather_events(days_ahead=DAYS_AHEAD)
 
     if not events:
         logger.warning("No active weather events found.")
-        return []
+        tg.send_message(tg.format_no_opportunities())
+        return [], []
 
     temp_events = [e for e in events if e["type"] == "temperature"]
     precip_events = [e for e in events if e["type"] == "precipitation"]
     climate_events = [e for e in events if e["type"] == "climate"]
 
-    logger.info(SEPARATOR)
-    logger.info("EVENTS SUMMARY")
-    logger.info(SEPARATOR)
-    logger.info("  Temperature events: %d", len(temp_events))
-    logger.info("  Precipitation events: %d", len(precip_events))
-    logger.info("  Climate/Science events: %d", len(climate_events))
-    logger.info("  TOTAL: %d events, %d markets",
-                len(events),
-                sum(len(e["markets"]) for e in events))
-    logger.info(SEPARATOR)
+    total_markets = sum(len(e["markets"]) for e in events)
+    tg.send_message(tg.format_scan_start(len(events), total_markets))
 
-    for ev in events:
-        logger.info(
-            "  [%s] %s | %s | %d markets | vol=$%.0f",
-            ev["type"].upper(),
-            ev.get("city_name", "Global"),
-            ev.get("date", ev.get("title", "")),
-            len(ev["markets"]),
-            ev.get("volume", 0),
-        )
+    logger.info(
+        "EVENTS: temp=%d, precip=%d, climate=%d, total=%d (%d markets)",
+        len(temp_events), len(precip_events), len(climate_events),
+        len(events), total_markets,
+    )
 
     all_opportunities: list[Opportunity] = []
 
@@ -79,17 +105,16 @@ def run_scan() -> list[Opportunity]:
         date_str = ev["date"]
 
         if city_key not in forecast_cache:
-            logger.info("Fetching forecast for %s...", city_info["name"])
             forecast_data = fetch_hourly_forecast(
                 lat=city_info["lat"],
                 lon=city_info["lon"],
                 unit=city_info["unit"],
                 timezone=city_info["timezone"],
+                forecast_days=DAYS_AHEAD,
             )
             if forecast_data:
                 forecast_cache[city_key] = forecast_data
             else:
-                logger.error("Failed to fetch forecast for %s", city_info["name"])
                 continue
             time.sleep(0.5)
 
@@ -104,18 +129,10 @@ def run_scan() -> list[Opportunity]:
             continue
 
         unit_label = "\u00b0F" if city_info["unit"] == "fahrenheit" else "\u00b0C"
-        logger.info(SEPARATOR)
         logger.info(
-            "ANALYZING TEMP: %s on %s (forecast max: %.1f%s)",
+            "TEMP: %s %s -> max %.1f%s",
             city_info["name"], date_str, forecast_max, unit_label,
         )
-
-        for m in ev["markets"]:
-            if not m.get("closed", False):
-                logger.info(
-                    "  Bucket: %-20s | YES: %5.1f%% | Liq: $%.0f",
-                    m["bucket_label"], m["yes_price"] * 100, m["liquidity"],
-                )
 
         opps = analyze_temperature_event(
             event=ev,
@@ -134,7 +151,6 @@ def run_scan() -> list[Opportunity]:
             p_info = PRECIPITATION_CITIES.get(city_key)
             if not p_info:
                 continue
-            logger.info("Fetching precipitation forecast for %s...", ev["city_name"])
             precip_data = fetch_monthly_precipitation(
                 lat=p_info["lat"],
                 lon=p_info["lon"],
@@ -152,19 +168,7 @@ def run_scan() -> list[Opportunity]:
         if forecast_total is None:
             continue
 
-        logger.info(SEPARATOR)
-        logger.info(
-            "ANALYZING PRECIP: %s (forecast total: %.1f inches so far + remaining days)",
-            ev["city_name"], forecast_total,
-        )
-
-        for m in ev["markets"]:
-            if not m.get("closed", False):
-                question = m.get("question", m.get("bucket_label", ""))
-                logger.info(
-                    "  %-50s | YES: %5.1f%% | Liq: $%.0f",
-                    question[:50], m["yes_price"] * 100, m["liquidity"],
-                )
+        logger.info("PRECIP: %s -> %.1f inches", ev["city_name"], forecast_total)
 
         opps = analyze_precipitation_event(
             event=ev,
@@ -175,64 +179,95 @@ def run_scan() -> list[Opportunity]:
         all_opportunities.extend(opps)
 
     if climate_events:
-        logger.info(SEPARATOR)
-        logger.info("CLIMATE/SCIENCE EVENTS (info only, no forecast model):")
         for ev in climate_events:
-            logger.info(SEPARATOR)
-            logger.info("  %s", ev["title"])
-            logger.info("  Vol: $%.0f | Markets: %d", ev.get("volume", 0), len(ev["markets"]))
-            for m in ev["markets"]:
-                if not m.get("closed", False):
-                    question = m.get("question", m.get("bucket_label", ""))
-                    logger.info(
-                        "    %-60s | YES: %5.1f%%",
-                        question[:60], m["yes_price"] * 100,
-                    )
+            logger.info("CLIMATE: %s | %d markets", ev["title"], len(ev["markets"]))
 
-    logger.info(SEPARATOR)
-    logger.info("SCAN RESULTS")
-    logger.info(SEPARATOR)
-
-    if all_opportunities:
-        all_opportunities.sort(key=lambda o: o.edge, reverse=True)
-        logger.info("Found %d trading opportunities:", len(all_opportunities))
-        for i, opp in enumerate(all_opportunities, 1):
-            logger.info(SEPARATOR)
-            logger.info("OPPORTUNITY #%d [%s]", i, opp.event_type.upper())
-            logger.info("  City:              %s", opp.city)
-            logger.info("  Date:              %s", opp.date)
-            logger.info("  Bucket:            %s", opp.bucket_label)
-            logger.info("  Forecast Value:    %.1f", opp.forecast_value)
-            logger.info("  Market YES Price:  %.1f%% ($%.3f)", opp.market_yes_price * 100, opp.market_yes_price)
-            logger.info("  Forecast Prob:     %.1f%%", opp.forecast_probability * 100)
-            logger.info("  Edge:              +%.1f%%", opp.edge * 100)
-            logger.info("  Expected Value:    $%.3f per $1", opp.expected_value)
-            logger.info("  Liquidity:         $%.0f", opp.liquidity)
-            logger.info("  Market ID:         %s", opp.market_id)
-            action = "BUY YES" if opp.edge > 0 else "SKIP"
-            logger.info("  [DRY RUN] Action:  %s @ $%.3f", action, opp.market_yes_price)
-    else:
+    if not all_opportunities:
         logger.info("No opportunities found with edge >= %.0f%%", EDGE_THRESHOLD * 100)
+        tg.send_message(tg.format_scan_summary(
+            len(events), len(temp_events), len(precip_events),
+            len(climate_events), 0, 0,
+        ))
+        return all_opportunities, []
+
+    all_opportunities.sort(key=lambda o: o.edge, reverse=True)
+    logger.info("Found %d opportunities", len(all_opportunities))
+
+    portfolio = load_portfolio()
+    bets_placed: list[dict] = []
+
+    for opp in all_opportunities:
+        if len(bets_placed) >= MAX_BETS_PER_SCAN:
+            break
+        opp_dict = asdict(opp)
+        bet = place_paper_bet(portfolio, opp_dict)
+        if bet:
+            bet_dict = asdict(bet)
+            bets_placed.append(bet_dict)
+            tg.send_message(tg.format_new_bet(bet_dict))
+            time.sleep(0.3)
+
+    portfolio.last_scan = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    save_portfolio(portfolio)
+
+    for i, opp in enumerate(all_opportunities[:10], 1):
+        logger.info(
+            "  #%d [%s] %s %s | %s | edge=+%.1f%% | mkt=%.1f%% fcst=%.1f%%",
+            i, opp.event_type.upper(), opp.city, opp.date,
+            opp.bucket_label, opp.edge * 100,
+            opp.market_yes_price * 100, opp.forecast_probability * 100,
+        )
+
+    tg.send_message(tg.format_scan_summary(
+        len(events), len(temp_events), len(precip_events),
+        len(climate_events), len(all_opportunities), len(bets_placed),
+    ))
+
+    portfolio = load_portfolio()
+    tg.send_message(tg.format_portfolio_summary({
+        "balance": portfolio.balance,
+        "starting_balance": portfolio.starting_balance,
+        "total_pnl": portfolio.total_pnl,
+        "wins": portfolio.wins,
+        "losses": portfolio.losses,
+        "active_bets": portfolio.active_bets,
+        "total_wagered": portfolio.total_wagered,
+    }))
 
     logger.info(SEPARATOR)
-    logger.info(
-        "SCAN COMPLETE | Events: %d (temp=%d, precip=%d, climate=%d) | Opportunities: %d",
-        len(events), len(temp_events), len(precip_events), len(climate_events),
-        len(all_opportunities),
-    )
+    logger.info("SCAN COMPLETE | Opps: %d | Bets: %d", len(all_opportunities), len(bets_placed))
+    logger.info(get_portfolio_summary(portfolio))
     logger.info(SEPARATOR)
 
-    return all_opportunities
+    return all_opportunities, bets_placed
 
 
 def main() -> None:
-    logger.info("Starting Polymarket Weather Bot v2 - UNIVERSAL SCANNER (DRY RUN)")
-    logger.info("Edge threshold: %.0f%% | Min liquidity: $%.0f", EDGE_THRESHOLD * 100, MIN_LIQUIDITY)
-    logger.info("Temperature cities: %s", ", ".join(c["name"] for c in CITIES.values()))
-    logger.info("Precipitation cities: %s", ", ".join(PRECIPITATION_CITIES.keys()))
+    logger.info("Starting Polymarket Weather Bot v3 - AUTO PAPER TRADER")
+    logger.info("Balance: $500 | Bet size: 5%% | Edge threshold: %.0f%%", EDGE_THRESHOLD * 100)
+    logger.info("Days: today + tomorrow | Scan interval: %ds", SCAN_INTERVAL_SECONDS)
+    logger.info("Cities: %s", ", ".join(c["name"] for c in CITIES.values()))
 
-    opportunities = run_scan()
-    logger.info("Bot scan finished. Found %d opportunities total.", len(opportunities))
+    tg.send_message(tg.format_bot_started())
+
+    while True:
+        try:
+            resolved = run_resolve_cycle()
+            if resolved:
+                logger.info("Resolved %d bets this cycle", len(resolved))
+
+            run_scan()
+
+            logger.info("Next scan in %d seconds...", SCAN_INTERVAL_SECONDS)
+            time.sleep(SCAN_INTERVAL_SECONDS)
+
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user.")
+            break
+        except Exception as exc:
+            logger.error("Error in scan cycle: %s", exc, exc_info=True)
+            tg.send_message(tg.format_error(str(exc)))
+            time.sleep(60)
 
 
 if __name__ == "__main__":
