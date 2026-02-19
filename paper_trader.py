@@ -12,7 +12,7 @@ PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
 
 STARTING_BALANCE = 500.0
 BET_FRACTION = 0.05
-MAX_BETS_PER_SCAN = 5
+MAX_BETS_PER_SCAN = 20
 
 
 @dataclass
