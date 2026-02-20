@@ -154,11 +154,13 @@ def _session_pnl_line(s: dict, p: Portfolio) -> str:
 def _main_text() -> str:
     p = load_portfolio()
     s = _load_settings()
-    roi = (p.balance - p.starting_balance) / p.starting_balance * 100 if p.starting_balance else 0
     ac = sum(b["cost"] for b in p.active_bets)
+    portfolio_value = p.balance + ac
+    real_pnl = portfolio_value - p.starting_balance
+    roi = real_pnl / p.starting_balance * 100 if p.starting_balance else 0
     w24, l24 = _wr(p.history, 24)
     w7, l7 = _wr(p.history, 168)
-    pe = "\U0001F4C8" if p.total_pnl >= 0 else "\U0001F4C9"
+    pe = "\U0001F4C8" if real_pnl >= 0 else "\U0001F4C9"
     status = "\U0001F7E2 \u0410\u043a\u0442\u0438\u0432\u043d\u0430" if s.get("session_active") else "\U0001F534 \u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0430"
     max_pct = s.get("max_bet_pct", 0.05)
     last_scan = p.last_scan or "\u2014"
@@ -180,7 +182,7 @@ def _main_text() -> str:
         "\U0001F504 \u0421\u043a\u0430\u043d: \u043a\u0430\u0436\u0434\u044b\u0435 5 \u043c\u0438\u043d\n"
         "\u23F1 \u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439: {last}"
     ).format(
-        line=LINE, bal=p.balance, pe=pe, pnl=p.total_pnl, roi=roi,
+        line=LINE, bal=p.balance, pe=pe, pnl=real_pnl, roi=roi,
         active=len(p.active_bets), ac=ac, closed=len(p.history),
         wr24=_fmt_wr(w24, l24), wr7=_fmt_wr(w7, l7),
         mpct=max_pct * 100, status=status, last=last_scan,
@@ -335,10 +337,12 @@ def _history_kb(page: int) -> InlineKeyboardMarkup:
 
 def _stats_text() -> str:
     p = load_portfolio()
-    roi = (p.balance - p.starting_balance) / p.starting_balance * 100 if p.starting_balance else 0
     w24, l24 = _wr(p.history, 24)
     w7, l7 = _wr(p.history, 168)
     ac = sum(b["cost"] for b in p.active_bets)
+    portfolio_value = p.balance + ac
+    real_pnl = portfolio_value - p.starting_balance
+    roi = real_pnl / p.starting_balance * 100 if p.starting_balance else 0
     bp = max((b.get("pnl", 0) for b in p.history), default=0)
     wp = min((b.get("pnl", 0) for b in p.history), default=0)
     avg = (p.total_pnl / len(p.history)) if p.history else 0
@@ -363,7 +367,7 @@ def _stats_text() -> str:
         "\U0001F3C6 \u041b\u0443\u0447\u0448\u0430\u044f: <b>${bp:+.2f}</b>\n"
         "\U0001F480 \u0425\u0443\u0434\u0448\u0430\u044f: <b>${wp:+.2f}</b>"
     ).format(
-        line=LINE, bal=p.balance, pnl=p.total_pnl, roi=roi, ac=ac,
+        line=LINE, bal=p.balance, pnl=real_pnl, roi=roi, ac=ac,
         wr24=_fmt_wr(w24, l24), wr7=_fmt_wr(w7, l7),
         wrall=_fmt_wr(p.wins, p.losses),
         total=p.total_bets, active=len(p.active_bets), closed=len(p.history),

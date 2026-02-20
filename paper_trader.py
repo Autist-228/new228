@@ -138,6 +138,9 @@ def _already_bet_on(portfolio: Portfolio, market_id: str) -> bool:
     for bet in portfolio.active_bets:
         if bet["market_id"] == market_id:
             return True
+    for bet in portfolio.history:
+        if bet["market_id"] == market_id:
+            return True
     return False
 
 
