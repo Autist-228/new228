@@ -76,7 +76,7 @@ def resolve_temperature_bet(bet: dict) -> Optional[bool]:
 
     today = datetime.now(timezone.utc).date()
     bet_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-    if bet_date >= today:
+    if bet_date > today:
         return None
 
     actual_max = fetch_actual_max_temperature(
