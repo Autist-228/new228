@@ -535,30 +535,10 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await asyncio.to_thread(run_scan)
     except Exception as exc:
         logger.error("Scan error: %s", exc, exc_info=True)
-        try:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text="\u26A0\uFE0F <b>\u041e\u0428\u0418\u0411\u041a\u0410 \u0421\u041a\u0410\u041d\u0410</b>\n\n{err}".format(err=exc),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
 
 
 async def startup_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=(
-                "\U0001F680 <b>\u0411\u041e\u0422 \u0417\u0410\u041f\u0423\u0429\u0415\u041d</b> \U0001F680\n\n"
-                + _main_text()
-                + "\n\n\U0001F4E1 \u0413\u043e\u0442\u043e\u0432 \u043a \u0440\u0430\u0431\u043e\u0442\u0435. \u041d\u0430\u0436\u043c\u0438 /start"
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_main_kb(),
-        )
-    except Exception as exc:
-        logger.error("Startup notify failed: %s", exc)
+    logger.info("Bot ready. No startup notification sent (silent mode).")
 
 
 def main() -> None:
@@ -593,7 +573,6 @@ def main() -> None:
     app.add_handler(conv_handler)
 
     if app.job_queue:
-        app.job_queue.run_once(startup_notify, when=2)
         app.job_queue.run_repeating(scan_job, interval=SCAN_INTERVAL, first=10)
 
     logger.info("Bot starting... Scan interval: %ds", SCAN_INTERVAL)
