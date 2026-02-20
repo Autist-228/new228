@@ -5,6 +5,8 @@ Run this as the main entry point instead of weather_bot.py.
 Provides button-based dashboard + auto-scanning every 5 minutes.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -59,6 +61,7 @@ def _dashboard() -> str:
     w7, l7 = _wr(p.history, 168)
     ac = sum(b["cost"] for b in p.active_bets)
     pe = "\U0001F4C8" if p.total_pnl >= 0 else "\U0001F4C9"
+    last_scan = p.last_scan or "\u2014"
 
     return (
         f"\U0001F3E6 <b>POLYMARKET WEATHER BOT</b>\n"
@@ -72,7 +75,7 @@ def _dashboard() -> str:
         f"\U0001F3AF \u0412\u0438\u043D\u0440\u0435\u0439\u0442 7\u0434: {_fmt_wr(w7, l7)}\n\n"
         f"{LINE}\n\n"
         f"\U0001F504 \u0410\u0432\u0442\u043E-\u0441\u043A\u0430\u043D: \u043A\u0430\u0436\u0434\u044B\u0435 5 \u043C\u0438\u043D\n"
-        f"\u23F1 \u041F\u043E\u0441\u043B\u0435\u0434\u043D\u0438\u0439: {p.last_scan or '\u2014'}"
+        f"\u23F1 \u041F\u043E\u0441\u043B\u0435\u0434\u043D\u0438\u0439: {last_scan}"
     )
 
 
@@ -111,11 +114,18 @@ def _positions() -> str:
     for b in show:
         edge_pct = b["edge"] * 100
         flag = _city_flag(b.get("city", ""))
+        bid = b["bet_id"]
+        city = b["city"]
+        date = b["date"]
+        blabel = b["bucket_label"]
+        cost = b["cost"]
+        shares = b["shares"]
+        yprice = b["yes_price"]
         lines.append(
-            f"\n\U0001F3AB <b>{b['bet_id']}</b>\n"
-            f"   {flag} {b['city']} \u2014 {b['date']}\n"
-            f"   \U0001F3AF {b['bucket_label']}\n"
-            f"   \U0001F4B5 ${b['cost']:.2f} | {b['shares']:.0f} \u0430\u043A\u0446\u0438\u0439 @ ${b['yes_price']:.3f}\n"
+            f"\n\U0001F3AB <b>{bid}</b>\n"
+            f"   {flag} {city} \u2014 {date}\n"
+            f"   \U0001F3AF {blabel}\n"
+            f"   \U0001F4B5 ${cost:.2f} | {shares:.0f} \u0430\u043A\u0446\u0438\u0439 @ ${yprice:.3f}\n"
             f"   \U0001F4C8 Edge: <b>+{edge_pct:.1f}%</b>\n"
         )
     if len(p.active_bets) > 8:
@@ -138,11 +148,18 @@ def _history() -> str:
     ]
     for b in recent:
         e = "\u2705" if b.get("outcome") == "WIN" else "\u274C"
+        bid = b["bet_id"]
+        outcome = b.get("outcome", "?")
+        pnl = b.get("pnl", 0)
+        city = b["city"]
+        date = b["date"]
+        blabel = b["bucket_label"]
+        resolved = b.get("resolved_at") or "\u2014"
         lines.append(
-            f"\n{e} <b>{b['bet_id']}</b> {b.get('outcome', '?')} | "
-            f"<b>${b.get('pnl', 0):+.2f}</b>\n"
-            f"   {b['city']} {b['date']} | {b['bucket_label']}\n"
-            f"   \u23F1 {b.get('resolved_at', '\u2014')}\n"
+            f"\n{e} <b>{bid}</b> {outcome} | "
+            f"<b>${pnl:+.2f}</b>\n"
+            f"   {city} {date} | {blabel}\n"
+            f"   \u23F1 {resolved}\n"
         )
     return "".join(lines)
 
