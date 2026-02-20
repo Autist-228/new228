@@ -136,8 +136,10 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
         logger.info("No opportunities found with edge >= %.0f%%", EDGE_THRESHOLD * 100)
         return all_opportunities, []
 
-    all_opportunities.sort(key=lambda o: o.edge, reverse=True)
-    logger.info("Found %d opportunities", len(all_opportunities))
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    all_opportunities.sort(key=lambda o: (0 if o.date == today_str else 1, -o.edge))
+    today_count = sum(1 for o in all_opportunities if o.date == today_str)
+    logger.info("Found %d opportunities (today: %d, tomorrow: %d)", len(all_opportunities), today_count, len(all_opportunities) - today_count)
 
     portfolio = load_portfolio()
     bets_placed: list[dict] = []

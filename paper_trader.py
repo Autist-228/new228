@@ -134,13 +134,30 @@ def save_portfolio(portfolio: Portfolio) -> None:
         json.dump(data, f, indent=2)
 
 
+MAX_BETS_PER_MARKET = 1
+REBET_COOLDOWN_MINUTES = 15
+
+
 def _already_bet_on(portfolio: Portfolio, market_id: str) -> bool:
     for bet in portfolio.active_bets:
         if bet["market_id"] == market_id:
             return True
-    for bet in portfolio.history:
-        if bet["market_id"] == market_id:
-            return True
+    history_bets = [b for b in portfolio.history if b["market_id"] == market_id]
+    if len(history_bets) >= MAX_BETS_PER_MARKET:
+        return True
+    if history_bets:
+        last = history_bets[-1]
+        resolved_at = last.get("resolved_at", "")
+        if resolved_at:
+            try:
+                rt = datetime.strptime(
+                    resolved_at.replace(" UTC", ""), "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(timezone.utc) - rt).total_seconds() / 60
+                if elapsed < REBET_COOLDOWN_MINUTES:
+                    return True
+            except (ValueError, TypeError):
+                pass
     return False
 
 
