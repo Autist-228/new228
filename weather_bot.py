@@ -27,7 +27,7 @@ from paper_trader import (
     resolve_bet,
     MAX_BETS_PER_SCAN,
 )
-from bet_resolver import try_resolve_bet
+from bet_resolver import try_resolve_bet, fetch_actual_max_temperature
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,11 +87,29 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
 
     all_opportunities: list[Opportunity] = []
 
+    today_date = datetime.now(timezone.utc).date()
+    resolved_cache: dict[str, bool] = {}
+
     forecast_cache: dict[str, dict] = {}
     for ev in temp_events:
         city_key = ev["city_key"]
         city_info = CITIES[city_key]
         date_str = ev["date"]
+
+        ev_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        if ev_date <= today_date:
+            cache_key = f"{city_key}_{date_str}"
+            if cache_key not in resolved_cache:
+                actual = fetch_actual_max_temperature(
+                    lat=city_info["lat"], lon=city_info["lon"],
+                    date_str=date_str, unit=city_info["unit"],
+                    timezone_str=city_info["timezone"],
+                )
+                resolved_cache[cache_key] = actual is not None
+                time.sleep(0.3)
+            if resolved_cache[cache_key]:
+                logger.info("SKIP %s %s - actual temp already known", city_info["name"], date_str)
+                continue
 
         if city_key not in forecast_cache:
             forecast_data = fetch_hourly_forecast(
@@ -136,10 +154,23 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
         logger.info("No opportunities found with edge >= %.0f%%", EDGE_THRESHOLD * 100)
         return all_opportunities, []
 
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_utc.strftime("%Y-%m-%d")
+    hours_left_today = (24 - now_utc.hour) + (0 if now_utc.minute == 0 else -now_utc.minute / 60)
+    include_tomorrow = hours_left_today < 9
+
     all_opportunities.sort(key=lambda o: (0 if o.date == today_str else 1, -o.edge))
     today_count = sum(1 for o in all_opportunities if o.date == today_str)
-    logger.info("Found %d opportunities (today: %d, tomorrow: %d)", len(all_opportunities), today_count, len(all_opportunities) - today_count)
+    tomorrow_count = len(all_opportunities) - today_count
+
+    if not include_tomorrow:
+        all_opportunities = [o for o in all_opportunities if o.date == today_str]
+
+    logger.info(
+        "Found %d opportunities (today: %d, tomorrow: %d) | %.1fh left today -> tomorrow %s",
+        len(all_opportunities), today_count, tomorrow_count if include_tomorrow else 0,
+        hours_left_today, "ON" if include_tomorrow else "OFF",
+    )
 
     portfolio = load_portfolio()
     bets_placed: list[dict] = []
