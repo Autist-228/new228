@@ -9,10 +9,37 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 STARTING_BALANCE = 500.0
 BET_FRACTION = 0.05
 MAX_BETS_PER_SCAN = 20
+
+
+def _load_max_bet_pct() -> float:
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+            return data.get("max_bet_pct", BET_FRACTION)
+        except Exception:
+            pass
+    return BET_FRACTION
+
+
+def _kelly_fraction(edge: float, yes_price: float, max_pct: float) -> float:
+    if yes_price <= 0 or yes_price >= 1 or edge <= 0:
+        return max_pct
+    b = (1.0 / yes_price) - 1.0
+    p = yes_price + edge
+    if p > 1:
+        p = 0.99
+    q = 1.0 - p
+    kelly = (b * p - q) / b
+    if kelly <= 0:
+        return 0.0
+    half_kelly = kelly * 0.5
+    return min(half_kelly, max_pct)
 
 
 @dataclass
@@ -120,7 +147,14 @@ def place_paper_bet(portfolio: Portfolio, opp: dict) -> Optional[PaperBet]:
         logger.info("Already have active bet on market %s, skipping", market_id)
         return None
 
-    bet_amount = round(portfolio.balance * BET_FRACTION, 2)
+    max_pct = _load_max_bet_pct()
+    edge = opp.get("edge", 0)
+    yes_price_val = opp.get("market_yes_price", 0)
+    frac = _kelly_fraction(edge, yes_price_val, max_pct)
+    if frac <= 0:
+        logger.info("Kelly says skip (negative EV), market %s", market_id)
+        return None
+    bet_amount = round(portfolio.balance * frac, 2)
     if bet_amount < 1.0:
         logger.warning("Balance too low for betting: $%.2f", portfolio.balance)
         return None

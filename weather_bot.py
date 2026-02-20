@@ -5,22 +5,18 @@ from datetime import datetime, timezone
 
 from config import (
     CITIES,
-    PRECIPITATION_CITIES,
     EDGE_THRESHOLD,
     MIN_LIQUIDITY,
     SCAN_INTERVAL_SECONDS,
 )
 from weather_forecast import (
     fetch_hourly_forecast,
-    fetch_monthly_precipitation,
-    estimate_monthly_precipitation,
     get_daily_max_from_hourly,
     get_hourly_temps_for_day,
 )
 from polymarket_api import discover_all_weather_events
 from opportunity_detector import (
     analyze_temperature_event,
-    analyze_precipitation_event,
     Opportunity,
 )
 from paper_trader import (
@@ -32,7 +28,6 @@ from paper_trader import (
     MAX_BETS_PER_SCAN,
 )
 from bet_resolver import try_resolve_bet
-import telegram_bot as tg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,7 +55,6 @@ def run_resolve_cycle() -> list[dict]:
         if result is not None:
             resolve_bet(portfolio, bet, won=result)
             resolved.append(bet)
-            tg.send_message(tg.format_bet_resolved(bet))
             time.sleep(0.5)
 
     if resolved:
@@ -80,20 +74,15 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
 
     if not events:
         logger.warning("No active weather events found.")
-        tg.send_message(tg.format_no_opportunities())
         return [], []
 
     temp_events = [e for e in events if e["type"] == "temperature"]
-    precip_events = [e for e in events if e["type"] == "precipitation"]
-    climate_events = [e for e in events if e["type"] == "climate"]
 
-    total_markets = sum(len(e["markets"]) for e in events)
-    tg.send_message(tg.format_scan_start(len(events), total_markets))
+    total_markets = sum(len(e["markets"]) for e in temp_events)
 
     logger.info(
-        "EVENTS: temp=%d, precip=%d, climate=%d, total=%d (%d markets)",
-        len(temp_events), len(precip_events), len(climate_events),
-        len(events), total_markets,
+        "EVENTS: temp=%d, total=%d markets",
+        len(temp_events), total_markets,
     )
 
     all_opportunities: list[Opportunity] = []
@@ -143,51 +132,8 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
         )
         all_opportunities.extend(opps)
 
-    precip_cache: dict[str, float] = {}
-    now = datetime.now(timezone.utc)
-    for ev in precip_events:
-        city_key = ev["city_key"]
-        if city_key not in precip_cache:
-            p_info = PRECIPITATION_CITIES.get(city_key)
-            if not p_info:
-                continue
-            precip_data = fetch_monthly_precipitation(
-                lat=p_info["lat"],
-                lon=p_info["lon"],
-                timezone_str=p_info["timezone"],
-                year=now.year,
-                month=now.month,
-            )
-            if precip_data:
-                total = estimate_monthly_precipitation(precip_data)
-                if total is not None:
-                    precip_cache[city_key] = total
-            time.sleep(0.5)
-
-        forecast_total = precip_cache.get(city_key)
-        if forecast_total is None:
-            continue
-
-        logger.info("PRECIP: %s -> %.1f inches", ev["city_name"], forecast_total)
-
-        opps = analyze_precipitation_event(
-            event=ev,
-            forecast_total=forecast_total,
-            edge_threshold=EDGE_THRESHOLD,
-            min_liquidity=MIN_LIQUIDITY,
-        )
-        all_opportunities.extend(opps)
-
-    if climate_events:
-        for ev in climate_events:
-            logger.info("CLIMATE: %s | %d markets", ev["title"], len(ev["markets"]))
-
     if not all_opportunities:
         logger.info("No opportunities found with edge >= %.0f%%", EDGE_THRESHOLD * 100)
-        tg.send_message(tg.format_scan_summary(
-            len(events), len(temp_events), len(precip_events),
-            len(climate_events), 0, 0,
-        ))
         return all_opportunities, []
 
     all_opportunities.sort(key=lambda o: o.edge, reverse=True)
@@ -204,7 +150,6 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
         if bet:
             bet_dict = asdict(bet)
             bets_placed.append(bet_dict)
-            tg.send_message(tg.format_new_bet(bet_dict))
             time.sleep(0.3)
 
     portfolio.last_scan = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -217,22 +162,6 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
             opp.bucket_label, opp.edge * 100,
             opp.market_yes_price * 100, opp.forecast_probability * 100,
         )
-
-    tg.send_message(tg.format_scan_summary(
-        len(events), len(temp_events), len(precip_events),
-        len(climate_events), len(all_opportunities), len(bets_placed),
-    ))
-
-    portfolio = load_portfolio()
-    tg.send_message(tg.format_portfolio_summary({
-        "balance": portfolio.balance,
-        "starting_balance": portfolio.starting_balance,
-        "total_pnl": portfolio.total_pnl,
-        "wins": portfolio.wins,
-        "losses": portfolio.losses,
-        "active_bets": portfolio.active_bets,
-        "total_wagered": portfolio.total_wagered,
-    }))
 
     logger.info(SEPARATOR)
     logger.info("SCAN COMPLETE | Opps: %d | Bets: %d", len(all_opportunities), len(bets_placed))
@@ -247,8 +176,6 @@ def main() -> None:
     logger.info("Balance: $500 | Bet size: 5%% | Edge threshold: %.0f%%", EDGE_THRESHOLD * 100)
     logger.info("Days: today + tomorrow | Scan interval: %ds", SCAN_INTERVAL_SECONDS)
     logger.info("Cities: %s", ", ".join(c["name"] for c in CITIES.values()))
-
-    tg.send_message(tg.format_bot_started())
 
     while True:
         try:
@@ -266,7 +193,6 @@ def main() -> None:
             break
         except Exception as exc:
             logger.error("Error in scan cycle: %s", exc, exc_info=True)
-            tg.send_message(tg.format_error(str(exc)))
             time.sleep(60)
 
 
