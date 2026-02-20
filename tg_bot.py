@@ -56,7 +56,7 @@ def _kelly_bet(balance: float, edge: float, yes_price: float, max_pct: float) ->
 
 
 def _load_settings() -> dict:
-    defaults = {"max_bet_pct": 0.05, "session_active": False}
+    defaults = {"max_bet_pct": 0.05, "session_active": False, "session_started_at": "", "session_start_balance": 0.0}
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r") as f:
@@ -133,6 +133,24 @@ def _city_flag(city: str) -> str:
     return flags.get(city, "\U0001F30D")
 
 
+def _session_pnl_line(s: dict, p: Portfolio) -> str:
+    if not s.get("session_active") and not s.get("session_started_at"):
+        return ""
+    start_bal = s.get("session_start_balance", 0.0)
+    if start_bal <= 0:
+        return ""
+    current_val = p.balance + sum(b["cost"] for b in p.active_bets)
+    session_pnl = current_val - start_bal
+    started = s.get("session_started_at", "")
+    icon = "\U0001F7E2" if session_pnl >= 0 else "\U0001F534"
+    line = "{icon} \u0421\u0435\u0441\u0441\u0438\u044f P&L: <b>${pnl:+.2f}</b>".format(
+        icon=icon, pnl=round(session_pnl, 2),
+    )
+    if started:
+        line += " (\u0441 {ts})".format(ts=started[:16])
+    return line + "\n"
+
+
 def _main_text() -> str:
     p = load_portfolio()
     s = _load_settings()
@@ -158,6 +176,7 @@ def _main_text() -> str:
         "{line}\n\n"
         "\U0001F4CE \u041c\u0430\u043a\u0441. \u0441\u0442\u0430\u0432\u043a\u0430: <b>{mpct:.0f}%</b> (\u043e\u0442 \u0431\u0430\u043b\u0430\u043d\u0441\u0430)\n"
         "\U0001F916 \u0421\u0435\u0441\u0441\u0438\u044f: {status}\n"
+        "{session_pnl_line}"
         "\U0001F504 \u0421\u043a\u0430\u043d: \u043a\u0430\u0436\u0434\u044b\u0435 5 \u043c\u0438\u043d\n"
         "\u23F1 \u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439: {last}"
     ).format(
@@ -165,6 +184,7 @@ def _main_text() -> str:
         active=len(p.active_bets), ac=ac, closed=len(p.history),
         wr24=_fmt_wr(w24, l24), wr7=_fmt_wr(w7, l7),
         mpct=max_pct * 100, status=status, last=last_scan,
+        session_pnl_line=_session_pnl_line(s, p),
     )
 
 
@@ -417,6 +437,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     elif d == "start_session":
         s = _load_settings()
         s["session_active"] = True
+        p = load_portfolio()
+        s["session_started_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        s["session_start_balance"] = p.balance
         _save_settings(s)
         text, kb = _main_text(), _main_kb()
     elif d == "stop_session":
