@@ -27,6 +27,7 @@ class Opportunity:
     market_id: str
     market_slug: str
     event_title: str
+    yes_token_id: str = ""
 
 
 def analyze_temperature_event(
@@ -77,6 +78,7 @@ def analyze_temperature_event(
                 market_id=m.get("id", ""),
                 market_slug=m.get("slug", ""),
                 event_title=event.get("title", ""),
+                yes_token_id=m.get("yes_token_id", ""),
             )
             opportunities.append(opp)
 
@@ -131,6 +133,7 @@ def analyze_precipitation_event(
                 market_id=m.get("id", ""),
                 market_slug=m.get("slug", ""),
                 event_title=event.get("title", ""),
+                yes_token_id=m.get("yes_token_id", ""),
             )
             opportunities.append(opp)
 

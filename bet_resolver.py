@@ -1,6 +1,4 @@
-import json
 import logging
-from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -19,6 +17,11 @@ def fetch_actual_max_temperature(
     unit: str,
     timezone_str: str,
 ) -> Optional[float]:
+    """Fetch actual max temperature from Open-Meteo Archive API.
+    
+    WARNING: Only use for PAST dates (strictly before today).
+    Archive API returns incomplete/partial data for the current day.
+    """
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -43,118 +46,50 @@ def fetch_actual_max_temperature(
 
 
 def check_market_resolution(market_id: str) -> Optional[str]:
-    url = f"{GAMMA_API_URL}/markets/{market_id}"
+    """Check if market is closed on Polymarket and get winning outcome."""
+    url = "{0}/markets/{1}".format(GAMMA_API_URL, market_id)
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         if data.get("closed", False):
             winning = data.get("winningOutcome", "")
-            return winning
+            if winning:
+                return winning
         return None
     except requests.RequestException as exc:
         logger.error("Failed to check market %s: %s", market_id, exc)
         return None
 
 
-def resolve_temperature_bet(bet: dict) -> Optional[bool]:
-    city_key = None
-    city_name = bet.get("city", "")
-    for key, info in CITIES.items():
-        if info["name"] == city_name:
-            city_key = key
-            break
-
-    if not city_key:
-        logger.warning("Cannot find city key for %s", city_name)
-        return _resolve_via_market(bet)
-
-    city_info = CITIES[city_key]
-    date_str = bet.get("date", "")
-    if not date_str:
-        return _resolve_via_market(bet)
-
-    today = datetime.now(timezone.utc).date()
-    bet_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-    if bet_date > today:
-        return None
-
-    actual_max = fetch_actual_max_temperature(
-        lat=city_info["lat"],
-        lon=city_info["lon"],
-        date_str=date_str,
-        unit=city_info["unit"],
-        timezone_str=city_info["timezone"],
-    )
-
-    if actual_max is None:
-        return _resolve_via_market(bet)
-
-    bucket_label = bet.get("bucket_label", "")
-    rounded_max = round(actual_max)
-
-    import re
-    m = re.match(r"(-?\d+)[°]?[FC]?\s+or\s+below", bucket_label, re.IGNORECASE)
-    if m:
-        threshold = int(m.group(1))
-        won = rounded_max <= threshold
-        logger.info(
-            "Resolve %s: actual max=%d, bucket='%s' -> %s",
-            bet["bet_id"], rounded_max, bucket_label, "WIN" if won else "LOSS",
-        )
-        return won
-
-    m = re.match(r"(-?\d+)[°]?[FC]?\s+or\s+higher", bucket_label, re.IGNORECASE)
-    if m:
-        threshold = int(m.group(1))
-        won = rounded_max >= threshold
-        logger.info(
-            "Resolve %s: actual max=%d, bucket='%s' -> %s",
-            bet["bet_id"], rounded_max, bucket_label, "WIN" if won else "LOSS",
-        )
-        return won
-
-    m = re.match(r"(-?\d+)\s*[-–]\s*(-?\d+)", bucket_label)
-    if m:
-        low = int(m.group(1))
-        high = int(m.group(2))
-        won = low <= rounded_max <= high
-        logger.info(
-            "Resolve %s: actual max=%d, bucket='%s' -> %s",
-            bet["bet_id"], rounded_max, bucket_label, "WIN" if won else "LOSS",
-        )
-        return won
-
-    m = re.match(r"(-?\d+)[°]?[FC]?$", bucket_label)
-    if m:
-        val = int(m.group(1))
-        won = rounded_max == val
-        logger.info(
-            "Resolve %s: actual max=%d, bucket='%s' -> %s",
-            bet["bet_id"], rounded_max, bucket_label, "WIN" if won else "LOSS",
-        )
-        return won
-
-    return _resolve_via_market(bet)
-
-
-def _resolve_via_market(bet: dict) -> Optional[bool]:
+def try_resolve_bet(bet: dict) -> Optional[bool]:
+    """Resolve bet ONLY via Polymarket market status (closed=True).
+    
+    Never use Archive API or forecast data for resolution.
+    Only trust Polymarket oracle. This prevents premature resolution
+    on incomplete intraday data.
+    """
     market_id = bet.get("market_id", "")
     if not market_id:
+        logger.warning("No market_id for bet %s, skip resolve", bet.get("bet_id", "?"))
         return None
+
     result = check_market_resolution(market_id)
     if result is None:
         return None
-    won = result.lower() == "yes"
+
+    side = bet.get("side", "YES")
+    if side == "YES":
+        won = result.lower() == "yes"
+    else:
+        won = result.lower() == "no"
+
     logger.info(
-        "Resolve %s via market API: outcome=%s -> %s",
-        bet["bet_id"], result, "WIN" if won else "LOSS",
+        "RESOLVE %s | %s %s | market closed -> winner=%s side=%s -> %s",
+        bet.get("bet_id", "?"),
+        bet.get("city", "?"),
+        bet.get("bucket_label", "?"),
+        result, side,
+        "WIN" if won else "LOSS",
     )
     return won
-
-
-def try_resolve_bet(bet: dict) -> Optional[bool]:
-    event_type = bet.get("event_type", "")
-    if event_type == "temperature":
-        return resolve_temperature_bet(bet)
-    return _resolve_via_market(bet)

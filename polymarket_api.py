@@ -36,6 +36,7 @@ def fetch_event_by_slug(slug: str) -> Optional[dict]:
 
 def extract_markets_from_event(event: dict) -> list[dict]:
     markets = event.get("markets", [])
+    neg_risk = event.get("negRisk", False)
     result = []
     for m in markets:
         try:
@@ -43,6 +44,13 @@ def extract_markets_from_event(event: dict) -> list[dict]:
             yes_price = float(prices[0]) if prices else 0.0
         except (json.JSONDecodeError, IndexError, ValueError):
             yes_price = 0.0
+
+        try:
+            clob_raw = m.get("clobTokenIds", "[]")
+            clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else (clob_raw or [])
+            yes_token_id = clob_ids[0] if clob_ids else ""
+        except (json.JSONDecodeError, IndexError):
+            yes_token_id = ""
 
         result.append({
             "id": m.get("id", ""),
@@ -55,6 +63,9 @@ def extract_markets_from_event(event: dict) -> list[dict]:
             "closed": m.get("closed", False),
             "active": m.get("active", True),
             "accepting_orders": m.get("acceptingOrders", True),
+            "yes_token_id": yes_token_id,
+            "neg_risk": neg_risk,
+            "condition_id": m.get("conditionId", ""),
         })
     return result
 

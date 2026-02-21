@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import os
@@ -20,7 +19,15 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from paper_trader import load_portfolio, save_portfolio, Portfolio
+from real_trader import (
+    load_portfolio,
+    save_portfolio,
+    load_settings,
+    save_settings,
+    get_trader,
+    RealPortfolio,
+    MIN_POL_WARNING,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,51 +36,10 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 AUTHORIZED_ID = int(CHAT_ID) if CHAT_ID else 0
 
 LINE = "\u2501" * 22
-SCAN_INTERVAL = 300
+SCAN_INTERVAL = 60
 ITEMS_PER_PAGE = 5
 
-SET_BALANCE, SET_MAX_BET = range(2)
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
-
-
-def _kelly_bet(balance: float, edge: float, yes_price: float, max_pct: float) -> float:
-    if yes_price <= 0 or yes_price >= 1 or edge <= 0:
-        return 0.0
-    b = (1.0 / yes_price) - 1.0
-    p = yes_price + edge
-    if p > 1:
-        p = 0.99
-    q = 1.0 - p
-    kelly_frac = (b * p - q) / b
-    if kelly_frac <= 0:
-        return 0.0
-    kelly_frac = kelly_frac * 0.5
-    frac = min(kelly_frac, max_pct)
-    bet_amt = round(balance * frac, 2)
-    return max(bet_amt, 0.0)
-
-
-def _load_settings() -> dict:
-    defaults = {"max_bet_pct": 0.05, "session_active": False, "session_started_at": "", "session_start_balance": 0.0}
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r") as f:
-                data = json.load(f)
-            for k, v in defaults.items():
-                if k not in data:
-                    data[k] = v
-            return data
-        except Exception:
-            pass
-    return defaults
-
-
-def _save_settings(s: dict) -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(s, f, indent=2)
+SET_MAX_PCT, SET_MAX_USD = range(2)
 
 
 def _wr(history: list, hours: int) -> tuple:
@@ -102,7 +68,7 @@ def _fmt_wr(w: int, l: int) -> str:
     return "{0}W / {1}L ({2}%)".format(w, l, w * 100 // t) if t > 0 else "\u2014"
 
 
-def _daily_pnl(history: list) -> dict:
+def _daily_pnl_calc(history: list) -> dict:
     daily = {}
     for b in history:
         ra = b.get("resolved_at", "")
@@ -133,89 +99,90 @@ def _city_flag(city: str) -> str:
     return flags.get(city, "\U0001F30D")
 
 
-def _session_pnl_line(s: dict, p: Portfolio) -> str:
-    if not s.get("session_active") and not s.get("session_started_at"):
-        return ""
-    start_bal = s.get("session_start_balance", 0.0)
-    if start_bal <= 0:
-        return ""
-    current_val = p.balance + sum(b["cost"] for b in p.active_bets)
-    session_pnl = current_val - start_bal
-    started = s.get("session_started_at", "")
-    icon = "\U0001F7E2" if session_pnl >= 0 else "\U0001F534"
-    line = "{icon} \u0421\u0435\u0441\u0441\u0438\u044f P&L: <b>${pnl:+.2f}</b>".format(
-        icon=icon, pnl=round(session_pnl, 2),
-    )
-    if started:
-        line += " (\u0441 {ts})".format(ts=started[:16])
-    return line + "\n"
-
-
 def _main_text() -> str:
     p = load_portfolio()
-    s = _load_settings()
+    s = load_settings()
+    trader = get_trader()
+
+    usdc = trader.get_usdc_balance() if trader.is_ready else 0.0
+    pol = trader.get_pol_balance() if trader.is_ready else 0.0
+
     ac = sum(b["cost"] for b in p.active_bets)
-    portfolio_value = p.balance + ac
-    real_pnl = portfolio_value - p.starting_balance
-    roi = real_pnl / p.starting_balance * 100 if p.starting_balance else 0
     w24, l24 = _wr(p.history, 24)
     w7, l7 = _wr(p.history, 168)
-    pe = "\U0001F4C8" if real_pnl >= 0 else "\U0001F4C9"
-    status = "\U0001F7E2 \u0410\u043a\u0442\u0438\u0432\u043d\u0430" if s.get("session_active") else "\U0001F534 \u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0430"
+
+    pnl_icon = "\U0001F4C8" if p.total_pnl >= 0 else "\U0001F4C9"
+    si = "\U0001F7E2" if s.get("session_active") else "\U0001F534"
+    stxt = "\u0410\u043a\u0442\u0438\u0432\u043d\u0430" if s.get("session_active") else "\u0421\u0442\u043e\u043f"
+
+    gas_warn = ""
+    if pol < MIN_POL_WARNING and trader.is_ready:
+        gas_warn = "\n\u26A0\uFE0F <b>\u041c\u0430\u043b\u043e \u0433\u0430\u0437\u0430! \u041f\u043e\u043f\u043e\u043b\u043d\u0438 POL</b>"
+
     max_pct = s.get("max_bet_pct", 0.05)
+    max_usd = s.get("max_bet_usd", 15.0)
     last_scan = p.last_scan or "\u2014"
 
     return (
-        "\U0001F3E6 <b>POLYMARKET WEATHER BOT</b>\n"
+        "\U0001F4B0 <b>POLYMARKET WEATHER BOT</b> [LIVE]\n"
         "{line}\n\n"
-        "\U0001F4B0 <b>\u0411\u0430\u043b\u0430\u043d\u0441: ${bal:.2f}</b>\n"
-        "{pe} P&L: <b>${pnl:+.2f}</b> ({roi:+.1f}%)\n\n"
+        "\U0001F4B5 \u0411\u0430\u043b\u0430\u043d\u0441: <b>${usdc:.2f} USDC</b>\n"
+        "\u26FD \u0413\u0430\u0437: <b>{pol:.4f} POL</b>{gas_warn}\n\n"
         "{line}\n\n"
         "\U0001F4CA \u041e\u0442\u043a\u0440\u044b\u0442\u043e: <b>{active}</b> \u0441\u0442\u0430\u0432\u043e\u043a (${ac:.2f})\n"
         "\u2705 \u0417\u0430\u043a\u0440\u044b\u0442\u043e: <b>{closed}</b> \u0441\u0442\u0430\u0432\u043e\u043a\n"
         "\U0001F3AF \u0412\u0438\u043d\u0440\u0435\u0439\u0442 24\u0447: {wr24}\n"
         "\U0001F3AF \u0412\u0438\u043d\u0440\u0435\u0439\u0442 7\u0434: {wr7}\n\n"
         "{line}\n\n"
-        "\U0001F4CE \u041c\u0430\u043a\u0441. \u0441\u0442\u0430\u0432\u043a\u0430: <b>{mpct:.0f}%</b> (\u043e\u0442 \u0431\u0430\u043b\u0430\u043d\u0441\u0430)\n"
-        "\U0001F916 \u0421\u0435\u0441\u0441\u0438\u044f: {status}\n"
-        "{session_pnl_line}"
-        "\U0001F504 \u0421\u043a\u0430\u043d: \u043a\u0430\u0436\u0434\u044b\u0435 5 \u043c\u0438\u043d\n"
+        "{pnl_icon} P&L: <b>${pnl:+.2f}</b>\n"
+        "\U0001F4B2 \u041e\u0431\u043e\u0440\u043e\u0442: ${wag:.2f}\n\n"
+        "{line}\n\n"
+        "\u2699\uFE0F <b>\u041d\u0410\u0421\u0422\u0420\u041e\u0419\u041a\u0418</b>\n"
+        "\U0001F4CE \u041c\u0430\u043a\u0441 %: <b>{mpct:.0f}%</b> \u043e\u0442 \u0431\u0430\u043b\u0430\u043d\u0441\u0430\n"
+        "\U0001F4B0 \u041c\u0430\u043a\u0441 $: <b>${musd:.2f}</b>\n"
+        "\U0001F504 \u0421\u043a\u0430\u043d: \u043a\u0430\u0436\u0434\u0443\u044e <b>1 \u043c\u0438\u043d</b>\n"
+        "\U0001F916 \u0421\u0435\u0441\u0441\u0438\u044f: {si} <b>{stxt}</b>\n"
         "\u23F1 \u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439: {last}"
     ).format(
-        line=LINE, bal=p.balance, pe=pe, pnl=real_pnl, roi=roi,
+        line=LINE, usdc=usdc, pol=pol, gas_warn=gas_warn,
         active=len(p.active_bets), ac=ac, closed=len(p.history),
         wr24=_fmt_wr(w24, l24), wr7=_fmt_wr(w7, l7),
-        mpct=max_pct * 100, status=status, last=last_scan,
-        session_pnl_line=_session_pnl_line(s, p),
+        pnl_icon=pnl_icon, pnl=p.total_pnl, wag=p.total_wagered,
+        mpct=max_pct * 100, musd=max_usd,
+        si=si, stxt=stxt, last=last_scan,
     )
 
 
 def _main_kb() -> InlineKeyboardMarkup:
-    s = _load_settings()
+    s = load_settings()
     if s.get("session_active"):
         session_btn = InlineKeyboardButton(
-            "\U0001F534 \u0421\u0442\u043e\u043f \u0441\u0435\u0441\u0441\u0438\u044e", callback_data="stop_session"
+            "\U0001F534 \u0421\u0442\u043e\u043f", callback_data="stop_session",
         )
     else:
         session_btn = InlineKeyboardButton(
-            "\U0001F7E2 \u0421\u0442\u0430\u0440\u0442 \u0441\u0435\u0441\u0441\u0438\u044e", callback_data="start_session"
+            "\U0001F7E2 \u0421\u0442\u0430\u0440\u0442", callback_data="start_session",
         )
     return InlineKeyboardMarkup([
-        [session_btn,
-         InlineKeyboardButton("\U0001F504 \u0421\u0431\u0440\u043e\u0441\u0438\u0442\u044c", callback_data="reset_confirm")],
-        [InlineKeyboardButton("\U0001F4CA \u041e\u0442\u043a\u0440\u044b\u0442\u044b\u0435", callback_data="pos:0"),
-         InlineKeyboardButton("\U0001F4CB \u0417\u0430\u043a\u0440\u044b\u0442\u044b\u0435", callback_data="hist:0")],
-        [InlineKeyboardButton("\U0001F4C8 \u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043a\u0430", callback_data="stats"),
-         InlineKeyboardButton("\U0001F4C5 P&L \u043f\u043e \u0434\u043d\u044f\u043c", callback_data="daily_pnl")],
-        [InlineKeyboardButton("\U0001F4B0 \u0411\u0430\u043b\u0430\u043d\u0441", callback_data="set_balance"),
-         InlineKeyboardButton("\U0001F4CE \u041c\u0430\u043a\u0441. \u0441\u0442\u0430\u0432\u043a\u0430", callback_data="set_maxbet")],
-        [InlineKeyboardButton("\U0001F504 \u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c", callback_data="refresh")],
+        [session_btn],
+        [
+            InlineKeyboardButton("\U0001F4CA \u041e\u0442\u043a\u0440\u044b\u0442\u044b\u0435", callback_data="pos:0"),
+            InlineKeyboardButton("\U0001F4CB \u0417\u0430\u043a\u0440\u044b\u0442\u044b\u0435", callback_data="hist:0"),
+        ],
+        [
+            InlineKeyboardButton("\U0001F4C8 \u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043a\u0430", callback_data="stats"),
+            InlineKeyboardButton("\U0001F4C5 P&L \u043f\u043e \u0434\u043d\u044f\u043c", callback_data="daily_pnl"),
+        ],
+        [
+            InlineKeyboardButton("\U0001F4CE \u041c\u0430\u043a\u0441 %", callback_data="set_maxpct"),
+            InlineKeyboardButton("\U0001F4B0 \u041c\u0430\u043a\u0441 $", callback_data="set_maxusd"),
+        ],
     ])
 
 
 def _back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("\u25C0\uFE0F \u041d\u0430\u0437\u0430\u0434", callback_data="refresh")]
+        [InlineKeyboardButton("\u25C0\uFE0F \u0413\u043b\u0430\u0432\u043d\u0430\u044f", callback_data="refresh")]
     ])
 
 
@@ -224,7 +191,7 @@ def _positions_text(page: int) -> str:
     total = len(p.active_bets)
     if not total:
         return (
-            "\U0001F4CA <b>\u041e\u0422\u041a\u0420\u042b\u0422\u042b\u0415 \u041f\u041e\u0417\u0418\u0426\u0418\u0418</b>\n"
+            "\U0001F4CA <b>\u041e\u0422\u041a\u0420\u042b\u0422\u042b\u0415</b>\n"
             "{line}\n\n"
             "\u041d\u0435\u0442 \u043e\u0442\u043a\u0440\u044b\u0442\u044b\u0445 \u0441\u0442\u0430\u0432\u043e\u043a."
         ).format(line=LINE)
@@ -235,28 +202,28 @@ def _positions_text(page: int) -> str:
     bets = p.active_bets[start:end]
 
     lines = [
-        "\U0001F4CA <b>\u041e\u0422\u041a\u0420\u042b\u0422\u042b\u0415 \u041f\u041e\u0417\u0418\u0426\u0418\u0418</b> ({cur}/{tot})\n{line}\n".format(
-            cur=page + 1, tot=total_pages, line=LINE
+        "\U0001F4CA <b>\u041e\u0422\u041a\u0420\u042b\u0422\u042b\u0415</b> ({cur}/{tot})\n{line}\n".format(
+            cur=page + 1, tot=total_pages, line=LINE,
         )
     ]
     for b in bets:
-        edge_pct = b["edge"] * 100
+        edge_pct = b.get("edge", 0) * 100
         flag = _city_flag(b.get("city", ""))
-        bid = b["bet_id"]
-        city = b["city"]
-        date = b["date"]
-        blabel = b["bucket_label"]
-        cost = b["cost"]
-        shares = b["shares"]
-        yprice = b["yes_price"]
         lines.append(
             "\n\U0001F3AB <b>{bid}</b>\n"
             "   {flag} {city} \u2014 {date}\n"
             "   \U0001F3AF {blabel}\n"
             "   \U0001F4B5 ${cost:.2f} | {shares:.0f} \u0430\u043a\u0446. @ ${yp:.3f}\n"
             "   \U0001F4C8 Edge: <b>+{edge:.1f}%</b>\n".format(
-                bid=bid, flag=flag, city=city, date=date,
-                blabel=blabel, cost=cost, shares=shares, yp=yprice, edge=edge_pct,
+                bid=b.get("bet_id", "?"),
+                flag=flag,
+                city=b.get("city", "?"),
+                date=b.get("date", "?"),
+                blabel=b.get("bucket_label", "?"),
+                cost=b.get("cost", 0),
+                shares=b.get("shares", b.get("size", 0)),
+                yp=b.get("yes_price", b.get("price", 0)),
+                edge=edge_pct,
             )
         )
     return "".join(lines)
@@ -283,7 +250,7 @@ def _history_text(page: int) -> str:
     total = len(p.history)
     if not total:
         return (
-            "\U0001F4CB <b>\u0418\u0421\u0422\u041e\u0420\u0418\u042f \u0421\u0414\u0415\u041b\u041e\u041a</b>\n"
+            "\U0001F4CB <b>\u0418\u0421\u0422\u041e\u0420\u0418\u042f</b>\n"
             "{line}\n\n"
             "\u0418\u0441\u0442\u043e\u0440\u0438\u044f \u043f\u0443\u0441\u0442\u0430."
         ).format(line=LINE)
@@ -295,25 +262,24 @@ def _history_text(page: int) -> str:
     bets = rev[start:end]
 
     lines = [
-        "\U0001F4CB <b>\u0418\u0421\u0422\u041e\u0420\u0418\u042f \u0421\u0414\u0415\u041b\u041e\u041a</b> ({cur}/{tot})\n{line}\n".format(
-            cur=page + 1, tot=total_pages, line=LINE
+        "\U0001F4CB <b>\u0418\u0421\u0422\u041e\u0420\u0418\u042f</b> ({cur}/{tot})\n{line}\n".format(
+            cur=page + 1, tot=total_pages, line=LINE,
         )
     ]
     for b in bets:
         e = "\u2705" if b.get("outcome") == "WIN" else "\u274C"
-        bid = b["bet_id"]
-        outcome = b.get("outcome", "?")
-        pnl = b.get("pnl", 0)
-        city = b["city"]
-        date = b["date"]
-        blabel = b["bucket_label"]
-        resolved = b.get("resolved_at") or "\u2014"
         lines.append(
             "\n{e} <b>{bid}</b> {out} | <b>${pnl:+.2f}</b>\n"
             "   {city} {date} | {blabel}\n"
             "   \u23F1 {res}\n".format(
-                e=e, bid=bid, out=outcome, pnl=pnl,
-                city=city, date=date, blabel=blabel, res=resolved,
+                e=e,
+                bid=b.get("bet_id", "?"),
+                out=b.get("outcome", "?"),
+                pnl=b.get("pnl", 0),
+                city=b.get("city", "?"),
+                date=b.get("date", "?"),
+                blabel=b.get("bucket_label", "?"),
+                res=b.get("resolved_at") or "\u2014",
             )
         )
     return "".join(lines)
@@ -340,17 +306,13 @@ def _stats_text() -> str:
     w24, l24 = _wr(p.history, 24)
     w7, l7 = _wr(p.history, 168)
     ac = sum(b["cost"] for b in p.active_bets)
-    portfolio_value = p.balance + ac
-    real_pnl = portfolio_value - p.starting_balance
-    roi = real_pnl / p.starting_balance * 100 if p.starting_balance else 0
     bp = max((b.get("pnl", 0) for b in p.history), default=0)
     wp = min((b.get("pnl", 0) for b in p.history), default=0)
     avg = (p.total_pnl / len(p.history)) if p.history else 0
 
     return (
         "\U0001F4C8 <b>\u0421\u0422\u0410\u0422\u0418\u0421\u0422\u0418\u041a\u0410</b>\n{line}\n\n"
-        "\U0001F4B0 \u0411\u0430\u043b\u0430\u043d\u0441: <b>${bal:.2f}</b>\n"
-        "\U0001F4CA P&L: <b>${pnl:+.2f}</b> ({roi:+.1f}%)\n"
+        "\U0001F4CA P&L: <b>${pnl:+.2f}</b>\n"
         "\U0001F4B5 \u0412 \u0441\u0442\u0430\u0432\u043a\u0430\u0445: ${ac:.2f}\n\n"
         "{line}\n\n"
         "\U0001F3AF <b>\u0412\u0418\u041d\u0420\u0415\u0419\u0422</b>\n"
@@ -363,11 +325,11 @@ def _stats_text() -> str:
         "   \u041e\u0442\u043a\u0440\u044b\u0442\u043e: {active}\n"
         "   \u0417\u0430\u043a\u0440\u044b\u0442\u043e: {closed}\n"
         "   \u041e\u0431\u043e\u0440\u043e\u0442: ${wag:.2f}\n\n"
-        "\U0001F4B2 \u0421\u0440\u0435\u0434\u043d. P&L/\u0441\u0434\u0435\u043b\u043a\u0430: <b>${avg:+.2f}</b>\n"
+        "\U0001F4B2 \u0421\u0440\u0435\u0434\u043d. P&L: <b>${avg:+.2f}</b>\n"
         "\U0001F3C6 \u041b\u0443\u0447\u0448\u0430\u044f: <b>${bp:+.2f}</b>\n"
         "\U0001F480 \u0425\u0443\u0434\u0448\u0430\u044f: <b>${wp:+.2f}</b>"
     ).format(
-        line=LINE, bal=p.balance, pnl=real_pnl, roi=roi, ac=ac,
+        line=LINE, pnl=p.total_pnl, ac=ac,
         wr24=_fmt_wr(w24, l24), wr7=_fmt_wr(w7, l7),
         wrall=_fmt_wr(p.wins, p.losses),
         total=p.total_bets, active=len(p.active_bets), closed=len(p.history),
@@ -377,7 +339,7 @@ def _stats_text() -> str:
 
 def _daily_pnl_text() -> str:
     p = load_portfolio()
-    daily = _daily_pnl(p.history)
+    daily = _daily_pnl_calc(p.history)
     if not daily:
         return (
             "\U0001F4C5 <b>P&L \u041f\u041e \u0414\u041d\u042f\u041c</b>\n"
@@ -408,12 +370,121 @@ def _daily_pnl_text() -> str:
     return "".join(lines)
 
 
+async def _update_main_message(context: ContextTypes.DEFAULT_TYPE):
+    s = load_settings()
+    msg_id = s.get("main_message_id")
+    chat_id = s.get("main_chat_id")
+    if not msg_id or not chat_id:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=_main_text(), parse_mode=ParseMode.HTML,
+            reply_markup=_main_kb(),
+        )
+    except Exception:
+        pass
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if AUTHORIZED_ID and update.effective_chat.id != AUTHORIZED_ID:
         return ConversationHandler.END
-    await update.message.reply_text(
-        _main_text(), parse_mode=ParseMode.HTML, reply_markup=_main_kb()
+
+    trader = get_trader()
+    if not trader.is_ready:
+        trader.initialize()
+
+    msg = await update.message.reply_text(
+        _main_text(), parse_mode=ParseMode.HTML, reply_markup=_main_kb(),
     )
+    s = load_settings()
+    s["main_message_id"] = msg.message_id
+    s["main_chat_id"] = msg.chat_id
+    save_settings(s)
+    return ConversationHandler.END
+
+
+async def _handle_start_session(q) -> int:
+    trader = get_trader()
+    if not trader.is_ready:
+        ok = trader.initialize()
+        if not ok:
+            try:
+                await q.edit_message_text(
+                    "\u274C \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f.\n\u041f\u0440\u043e\u0432\u0435\u0440\u044c PRIVATE_KEY.",
+                    parse_mode=ParseMode.HTML, reply_markup=_back_kb(),
+                )
+            except Exception:
+                pass
+            return ConversationHandler.END
+
+    pol = trader.get_pol_balance()
+    usdc = trader.get_usdc_balance()
+
+    if usdc < 1.0:
+        text = (
+            "\u26A0\uFE0F <b>\u041d\u0435\u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447\u043d\u043e USDC</b>\n\n"
+            "\U0001F4B5 \u0411\u0430\u043b\u0430\u043d\u0441: ${usdc:.2f}\n"
+            "\u26FD \u0413\u0430\u0437: {pol:.4f} POL\n\n"
+            "\u041f\u043e\u043f\u043e\u043b\u043d\u0438 USDC \u043d\u0430 Polygon."
+        ).format(usdc=usdc, pol=pol)
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=_back_kb())
+        except Exception:
+            pass
+        return ConversationHandler.END
+
+    allowances = trader.check_allowances()
+    all_ok = all(allowances.values()) if allowances else False
+    if not all_ok:
+        if pol < 0.01:
+            text = (
+                "\u26A0\uFE0F <b>\u041d\u0443\u0436\u043d\u044b \u0440\u0430\u0437\u0440\u0435\u0448\u0435\u043d\u0438\u044f</b>\n\n"
+                "\u0413\u0430\u0437\u0430 \u043d\u0435 \u0445\u0432\u0430\u0442\u0430\u0435\u0442 ({pol:.4f} POL).\n"
+                "\u041f\u043e\u043f\u043e\u043b\u043d\u0438 POL \u043d\u0430 Polygon (~0.1 POL)."
+            ).format(pol=pol)
+            try:
+                await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=_back_kb())
+            except Exception:
+                pass
+            return ConversationHandler.END
+
+        try:
+            await q.edit_message_text(
+                "\u23F3 \u0423\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u044e \u0440\u0430\u0437\u0440\u0435\u0448\u0435\u043d\u0438\u044f... (~30\u0441)",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        ok = await asyncio.to_thread(trader.set_allowances)
+        if not ok:
+            try:
+                await q.edit_message_text(
+                    "\u274C \u041e\u0448\u0438\u0431\u043a\u0430 \u0440\u0430\u0437\u0440\u0435\u0448\u0435\u043d\u0438\u0439. \u041f\u0440\u043e\u0432\u0435\u0440\u044c POL.",
+                    parse_mode=ParseMode.HTML, reply_markup=_back_kb(),
+                )
+            except Exception:
+                pass
+            return ConversationHandler.END
+
+        s2 = load_settings()
+        s2["allowances_set"] = True
+        save_settings(s2)
+
+    s = load_settings()
+    s["session_active"] = True
+    s["session_started_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    save_settings(s)
+
+    text, kb = _main_text(), _main_kb()
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        s["main_message_id"] = q.message.message_id
+        s["main_chat_id"] = q.message.chat_id
+        save_settings(s)
+    except Exception:
+        pass
     return ConversationHandler.END
 
 
@@ -439,94 +510,44 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     elif d == "daily_pnl":
         text, kb = _daily_pnl_text(), _back_kb()
     elif d == "start_session":
-        s = _load_settings()
-        s["session_active"] = True
-        p = load_portfolio()
-        s["session_started_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        s["session_start_balance"] = p.balance
-        _save_settings(s)
-        text, kb = _main_text(), _main_kb()
+        return await _handle_start_session(q)
     elif d == "stop_session":
-        s = _load_settings()
+        s = load_settings()
         s["session_active"] = False
-        _save_settings(s)
+        save_settings(s)
         text, kb = _main_text(), _main_kb()
-    elif d == "reset_confirm":
+    elif d == "set_maxpct":
         text = (
-            "\u26A0\uFE0F <b>\u0421\u0411\u0420\u041e\u0421 \u0421\u0415\u0421\u0421\u0418\u0418</b>\n\n"
-            "\u0412\u0441\u0435 \u0441\u0442\u0430\u0432\u043a\u0438 \u0438 \u0438\u0441\u0442\u043e\u0440\u0438\u044f \u0431\u0443\u0434\u0443\u0442 \u0443\u0434\u0430\u043b\u0435\u043d\u044b.\n"
-            "\u0411\u0430\u043b\u0430\u043d\u0441 \u0432\u0435\u0440\u043d\u0451\u0442\u0441\u044f \u043a \u043d\u0430\u0447\u0430\u043b\u044c\u043d\u043e\u043c\u0443.\n\n"
-            "\u0422\u044b \u0443\u0432\u0435\u0440\u0435\u043d?"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("\u2705 \u0414\u0430, \u0441\u0431\u0440\u043e\u0441\u0438\u0442\u044c", callback_data="reset_yes"),
-             InlineKeyboardButton("\u274C \u041e\u0442\u043c\u0435\u043d\u0430", callback_data="refresh")],
-        ])
-    elif d == "reset_yes":
-        p = load_portfolio()
-        new_p = Portfolio(
-            balance=p.starting_balance,
-            starting_balance=p.starting_balance,
-            total_bets=0, wins=0, losses=0,
-            total_wagered=0.0, total_pnl=0.0,
-            active_bets=[], history=[], last_scan="",
-        )
-        save_portfolio(new_p)
-        s = _load_settings()
-        s["session_active"] = False
-        _save_settings(s)
-        text, kb = _main_text(), _main_kb()
-    elif d == "set_balance":
-        text = (
-            "\U0001F4B0 <b>\u0418\u0417\u041c\u0415\u041d\u0418\u0422\u042c \u0411\u0410\u041b\u0410\u041d\u0421</b>\n\n"
-            "\u0412\u0432\u0435\u0434\u0438 \u043d\u043e\u0432\u044b\u0439 \u0431\u0430\u043b\u0430\u043d\u0441 (\u0447\u0438\u0441\u043b\u043e):"
+            "\U0001F4CE <b>\u041c\u0410\u041a\u0421 %</b>\n\n"
+            "\u0412\u0432\u0435\u0434\u0438 \u043c\u0430\u043a\u0441 % \u0441\u0442\u0430\u0432\u043a\u0438\n"
+            "(\u043d\u0430\u043f\u0440: 5 = 5% \u043e\u0442 \u0431\u0430\u043b\u0430\u043d\u0441\u0430):"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML)
-        return SET_BALANCE
-    elif d == "set_maxbet":
+        return SET_MAX_PCT
+    elif d == "set_maxusd":
         text = (
-            "\U0001F4CE <b>\u041c\u0410\u041a\u0421. \u0421\u0422\u0410\u0412\u041a\u0410</b>\n\n"
-            "\u0412\u0432\u0435\u0434\u0438 \u043c\u0430\u043a\u0441\u0438\u043c\u0430\u043b\u044c\u043d\u044b\u0439 % \u0441\u0442\u0430\u0432\u043a\u0438\n"
-            "(\u043d\u0430\u043f\u0440\u0438\u043c\u0435\u0440 5 = 5% \u043e\u0442 \u0431\u0430\u043b\u0430\u043d\u0441\u0430):"
+            "\U0001F4B0 <b>\u041c\u0410\u041a\u0421 $</b>\n\n"
+            "\u0412\u0432\u0435\u0434\u0438 \u043c\u0430\u043a\u0441 \u0441\u0442\u0430\u0432\u043a\u0443 \u0432 $\n"
+            "(\u043d\u0430\u043f\u0440: 15 = \u043c\u0430\u043a\u0441 $15):"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML)
-        return SET_MAX_BET
+        return SET_MAX_USD
     else:
         return ConversationHandler.END
 
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        if d in ("refresh", "stop_session"):
+            s = load_settings()
+            s["main_message_id"] = q.message.message_id
+            s["main_chat_id"] = q.message.chat_id
+            save_settings(s)
     except Exception:
         pass
     return ConversationHandler.END
 
 
-async def handle_set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if AUTHORIZED_ID and update.effective_chat.id != AUTHORIZED_ID:
-        return ConversationHandler.END
-    txt = update.message.text.strip().replace(",", ".").replace("$", "")
-    try:
-        new_bal = float(txt)
-        if new_bal < 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text(
-            "\u274C \u041d\u0435\u0432\u0435\u0440\u043d\u043e\u0435 \u0447\u0438\u0441\u043b\u043e. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439 \u0435\u0449\u0451:",
-        )
-        return SET_BALANCE
-
-    p = load_portfolio()
-    p.balance = new_bal
-    p.starting_balance = new_bal
-    save_portfolio(p)
-
-    await update.message.reply_text(
-        _main_text(), parse_mode=ParseMode.HTML, reply_markup=_main_kb()
-    )
-    return ConversationHandler.END
-
-
-async def handle_set_maxbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_set_maxpct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if AUTHORIZED_ID and update.effective_chat.id != AUTHORIZED_ID:
         return ConversationHandler.END
     txt = update.message.text.strip().replace("%", "").replace(",", ".")
@@ -535,23 +556,47 @@ async def handle_set_maxbet(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if pct <= 0 or pct > 100:
             raise ValueError
     except ValueError:
-        await update.message.reply_text(
-            "\u274C \u0412\u0432\u0435\u0434\u0438 \u0447\u0438\u0441\u043b\u043e \u043e\u0442 1 \u0434\u043e 100:",
-        )
-        return SET_MAX_BET
+        await update.message.reply_text("\u274C \u0412\u0432\u0435\u0434\u0438 \u0447\u0438\u0441\u043b\u043e \u043e\u0442 1 \u0434\u043e 100:")
+        return SET_MAX_PCT
 
-    s = _load_settings()
+    s = load_settings()
     s["max_bet_pct"] = pct / 100.0
-    _save_settings(s)
-
-    await update.message.reply_text(
-        _main_text(), parse_mode=ParseMode.HTML, reply_markup=_main_kb()
+    save_settings(s)
+    msg = await update.message.reply_text(
+        _main_text(), parse_mode=ParseMode.HTML, reply_markup=_main_kb(),
     )
+    s["main_message_id"] = msg.message_id
+    s["main_chat_id"] = msg.chat_id
+    save_settings(s)
+    return ConversationHandler.END
+
+
+async def handle_set_maxusd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if AUTHORIZED_ID and update.effective_chat.id != AUTHORIZED_ID:
+        return ConversationHandler.END
+    txt = update.message.text.strip().replace("$", "").replace(",", ".")
+    try:
+        val = float(txt)
+        if val <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("\u274C \u0412\u0432\u0435\u0434\u0438 \u0441\u0443\u043c\u043c\u0443 \u0431\u043e\u043b\u044c\u0448\u0435 0:")
+        return SET_MAX_USD
+
+    s = load_settings()
+    s["max_bet_usd"] = val
+    save_settings(s)
+    msg = await update.message.reply_text(
+        _main_text(), parse_mode=ParseMode.HTML, reply_markup=_main_kb(),
+    )
+    s["main_message_id"] = msg.message_id
+    s["main_chat_id"] = msg.chat_id
+    save_settings(s)
     return ConversationHandler.END
 
 
 async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = _load_settings()
+    s = load_settings()
     if not s.get("session_active"):
         return
 
@@ -563,9 +608,16 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         logger.error("Scan error: %s", exc, exc_info=True)
 
+    await _update_main_message(context)
 
-async def startup_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("Bot ready. No startup notification sent (silent mode).")
+
+async def startup_init(context: ContextTypes.DEFAULT_TYPE) -> None:
+    trader = get_trader()
+    if trader.private_key and trader.wallet_address:
+        trader.initialize()
+        logger.info("Trader initialized on startup")
+    else:
+        logger.info("No wallet configured yet")
 
 
 def main() -> None:
@@ -590,8 +642,8 @@ def main() -> None:
             CallbackQueryHandler(on_button),
         ],
         states={
-            SET_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_set_balance)],
-            SET_MAX_BET: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_set_maxbet)],
+            SET_MAX_PCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_set_maxpct)],
+            SET_MAX_USD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_set_maxusd)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         per_message=False,
@@ -600,9 +652,10 @@ def main() -> None:
     app.add_handler(conv_handler)
 
     if app.job_queue:
-        app.job_queue.run_repeating(scan_job, interval=SCAN_INTERVAL, first=10)
+        app.job_queue.run_once(startup_init, when=2)
+        app.job_queue.run_repeating(scan_job, interval=SCAN_INTERVAL, first=15)
 
-    logger.info("Bot starting... Scan interval: %ds", SCAN_INTERVAL)
+    logger.info("Bot starting... Scan every %ds", SCAN_INTERVAL)
     app.run_polling(drop_pending_updates=True)
 
 
