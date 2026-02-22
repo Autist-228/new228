@@ -115,6 +115,26 @@ def _main_text() -> str:
     si = "\U0001F7E2" if s.get("session_active") else "\U0001F534"
     stxt = "\u0410\u043a\u0442\u0438\u0432\u043d\u0430" if s.get("session_active") else "\u0421\u0442\u043e\u043f"
 
+    uptime_str = "\u2014"
+    started_at = s.get("session_started_at", "")
+    if started_at and s.get("session_active"):
+        try:
+            st = datetime.strptime(
+                started_at.replace(" UTC", ""), "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - st
+            days = delta.days
+            hours = delta.seconds // 3600
+            mins = (delta.seconds % 3600) // 60
+            if days > 0:
+                uptime_str = "{0}d {1}h {2}m".format(days, hours, mins)
+            elif hours > 0:
+                uptime_str = "{0}h {1}m".format(hours, mins)
+            else:
+                uptime_str = "{0}m".format(mins)
+        except (ValueError, TypeError):
+            pass
+
     gas_warn = ""
     if pol < MIN_POL_WARNING and trader.is_ready:
         gas_warn = "\n\u26A0\uFE0F <b>\u041c\u0430\u043b\u043e \u0433\u0430\u0437\u0430! \u041f\u043e\u043f\u043e\u043b\u043d\u0438 POL</b>"
@@ -142,14 +162,15 @@ def _main_text() -> str:
         "\U0001F4B0 \u041c\u0430\u043a\u0441 $: <b>${musd:.2f}</b>\n"
         "\U0001F504 \u0421\u043a\u0430\u043d: \u043a\u0430\u0436\u0434\u0443\u044e <b>5 \u043c\u0438\u043d</b>\n"
         "\U0001F916 \u0421\u0435\u0441\u0441\u0438\u044f: {si} <b>{stxt}</b>\n"
-        "\u23F1 \u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439: {last}"
+        "\u23F1 \u0410\u043f\u0442\u0430\u0439\u043c: <b>{uptime}</b>\n"
+        "\U0001F504 \u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0441\u043a\u0430\u043d: {last}"
     ).format(
         line=LINE, usdc=usdc, pol=pol, gas_warn=gas_warn,
         active=len(p.active_bets), ac=ac, closed=len(p.history),
         wr24=_fmt_wr(w24, l24), wr7=_fmt_wr(w7, l7),
         pnl_icon=pnl_icon, pnl=p.total_pnl, wag=p.total_wagered,
         mpct=max_pct * 100, musd=max_usd,
-        si=si, stxt=stxt, last=last_scan,
+        si=si, stxt=stxt, uptime=uptime_str, last=last_scan,
     )
 
 
