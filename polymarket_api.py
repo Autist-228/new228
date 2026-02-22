@@ -1,0 +1,168 @@
+import json
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import requests
+
+from config import GAMMA_API_URL, CITIES, PRECIPITATION_CITIES, CLIMATE_EVENT_SLUGS
+
+logger = logging.getLogger(__name__)
+
+
+def build_event_slug(city_slug: str, date_str: str) -> str:
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    month = dt.strftime("%B").lower()
+    day = dt.day
+    year = dt.year
+    return f"highest-temperature-in-{city_slug}-on-{month}-{day}-{year}"
+
+
+def fetch_event_by_slug(slug: str) -> Optional[dict]:
+    url = f"{GAMMA_API_URL}/events"
+    params = {"slug": slug}
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            return data[0]
+        return None
+    except requests.RequestException as exc:
+        logger.error("Gamma API request failed for slug %s: %s", slug, exc)
+        return None
+
+
+def extract_markets_from_event(event: dict) -> list[dict]:
+    markets = event.get("markets", [])
+    neg_risk = event.get("negRisk", False)
+    result = []
+    for m in markets:
+        try:
+            prices = json.loads(m.get("outcomePrices", "[]"))
+            yes_price = float(prices[0]) if prices else 0.0
+        except (json.JSONDecodeError, IndexError, ValueError):
+            yes_price = 0.0
+
+        try:
+            clob_raw = m.get("clobTokenIds", "[]")
+            clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else (clob_raw or [])
+            yes_token_id = clob_ids[0] if clob_ids else ""
+        except (json.JSONDecodeError, IndexError):
+            yes_token_id = ""
+
+        result.append({
+            "id": m.get("id", ""),
+            "question": m.get("question", ""),
+            "slug": m.get("slug", ""),
+            "bucket_label": m.get("groupItemTitle", ""),
+            "yes_price": yes_price,
+            "volume": m.get("volumeNum", 0),
+            "liquidity": m.get("liquidityNum", 0),
+            "closed": m.get("closed", False),
+            "active": m.get("active", True),
+            "accepting_orders": m.get("acceptingOrders", True),
+            "yes_token_id": yes_token_id,
+            "neg_risk": neg_risk,
+            "condition_id": m.get("conditionId", ""),
+        })
+    return result
+
+
+def discover_temperature_events(days_ahead: int = 3) -> list[dict]:
+    events = []
+    today = datetime.now(timezone.utc).date()
+    for day_offset in range(days_ahead):
+        target_date = today + timedelta(days=day_offset)
+        date_str = target_date.strftime("%Y-%m-%d")
+        for city_key, city_info in CITIES.items():
+            slug = build_event_slug(city_info["slug_name"], date_str)
+            event = fetch_event_by_slug(slug)
+            if event and not event.get("closed", False):
+                markets = extract_markets_from_event(event)
+                if markets:
+                    events.append({
+                        "type": "temperature",
+                        "city_key": city_key,
+                        "city_name": city_info["name"],
+                        "date": date_str,
+                        "slug": slug,
+                        "event_id": event.get("id", ""),
+                        "title": event.get("title", ""),
+                        "volume": event.get("volume", 0),
+                        "liquidity": event.get("liquidity", 0),
+                        "markets": markets,
+                    })
+            time.sleep(0.3)
+    return events
+
+
+def discover_precipitation_events() -> list[dict]:
+    events = []
+    now = datetime.now(timezone.utc)
+    month_lower = now.strftime("%B").lower()
+
+    for city_key, city_info in PRECIPITATION_CITIES.items():
+        slug = city_info["slug_pattern"].format(month_lower=month_lower)
+        event = fetch_event_by_slug(slug)
+        if event and not event.get("closed", False):
+            markets = extract_markets_from_event(event)
+            if markets:
+                city_display = CITIES[city_key]["name"] if city_key in CITIES else city_key.upper()
+                events.append({
+                    "type": "precipitation",
+                    "city_key": city_key,
+                    "city_name": city_display,
+                    "date": now.strftime("%Y-%m"),
+                    "slug": slug,
+                    "event_id": event.get("id", ""),
+                    "title": event.get("title", ""),
+                    "volume": event.get("volume", 0),
+                    "liquidity": event.get("liquidity", 0),
+                    "markets": markets,
+                })
+        time.sleep(0.3)
+    return events
+
+
+def discover_climate_events() -> list[dict]:
+    events = []
+    for slug in CLIMATE_EVENT_SLUGS:
+        event = fetch_event_by_slug(slug)
+        if event and not event.get("closed", False):
+            markets = extract_markets_from_event(event)
+            active_markets = [m for m in markets if not m.get("closed", False)]
+            if active_markets:
+                events.append({
+                    "type": "climate",
+                    "city_key": "",
+                    "city_name": "Global",
+                    "date": "",
+                    "slug": slug,
+                    "event_id": event.get("id", ""),
+                    "title": event.get("title", ""),
+                    "volume": event.get("volume", 0),
+                    "liquidity": event.get("liquidity", 0),
+                    "markets": active_markets,
+                })
+        time.sleep(0.3)
+    return events
+
+
+def discover_all_weather_events(days_ahead: int = 3) -> list[dict]:
+    logger.info("Discovering daily temperature events...")
+    temp_events = discover_temperature_events(days_ahead)
+    logger.info("Found %d temperature events", len(temp_events))
+
+    logger.info("Discovering precipitation events...")
+    precip_events = discover_precipitation_events()
+    logger.info("Found %d precipitation events", len(precip_events))
+
+    logger.info("Discovering climate/science events...")
+    climate_events = discover_climate_events()
+    logger.info("Found %d climate events", len(climate_events))
+
+    all_events = temp_events + precip_events + climate_events
+    logger.info("Total weather-related events: %d", len(all_events))
+    return all_events
