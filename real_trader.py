@@ -558,8 +558,7 @@ def place_real_bet(portfolio: RealPortfolio, opp: dict, trader: Trader) -> Optio
     edge = opp.get("edge", 0)
     yes_price = opp.get("market_yes_price", 0)
 
-    bet_amount = min(max_usd, usdc_balance * 0.10)
-    bet_amount = round(bet_amount, 2)
+    bet_amount = round(max_usd, 2)
 
     if bet_amount < MIN_BET_USDC:
         logger.warning("Bet too small: $%.2f", bet_amount)
