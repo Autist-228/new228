@@ -166,19 +166,14 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
 
     now_utc = datetime.now(timezone.utc)
     today_str = now_utc.strftime("%Y-%m-%d")
-    hours_left_today = (24 - now_utc.hour) + (0 if now_utc.minute == 0 else -now_utc.minute / 60)
-    include_tomorrow = hours_left_today < 9
 
     all_opportunities.sort(key=lambda o: (0 if o.date == today_str else 1, -o.edge))
     today_count = sum(1 for o in all_opportunities if o.date == today_str)
     tomorrow_count = len(all_opportunities) - today_count
-    if not include_tomorrow:
-        all_opportunities = [o for o in all_opportunities if o.date == today_str]
 
     logger.info(
-        "Found %d opps (today: %d, tmrw: %d) | %.1fh left -> tmrw %s",
-        len(all_opportunities), today_count, tomorrow_count if include_tomorrow else 0,
-        hours_left_today, "ON" if include_tomorrow else "OFF",
+        "Found %d opps (today: %d, tmrw: %d)",
+        len(all_opportunities), today_count, tomorrow_count,
     )
 
     usdc_bal = trader.get_usdc_balance()
