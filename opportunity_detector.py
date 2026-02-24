@@ -36,6 +36,7 @@ def analyze_temperature_event(
     forecast_max: float,
     edge_threshold: float = EDGE_THRESHOLD,
     min_liquidity: float = MIN_LIQUIDITY,
+    ensemble_temps: list[float] | None = None,
 ) -> list[Opportunity]:
     opportunities: list[Opportunity] = []
     markets = event.get("markets", [])
@@ -56,7 +57,8 @@ def analyze_temperature_event(
             continue
 
         forecast_prob = estimate_bucket_probability(
-            hourly_temps, bucket_low, bucket_high
+            hourly_temps, bucket_low, bucket_high,
+            ensemble_temps=ensemble_temps,
         )
 
         edge = forecast_prob - yes_price

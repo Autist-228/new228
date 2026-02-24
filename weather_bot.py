@@ -11,6 +11,7 @@ from config import (
 )
 from weather_forecast import (
     fetch_hourly_forecast,
+    fetch_ensemble_daily_maxes,
     get_daily_max_from_hourly,
     get_hourly_temps_for_day,
 )
@@ -105,6 +106,7 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
     today_date = datetime.now(timezone.utc).date()
     resolved_cache: dict[str, bool] = {}
     forecast_cache: dict[str, dict] = {}
+    ensemble_cache: dict[str, dict[str, list[float]]] = {}
 
     for ev in temp_events:
         city_key = ev["city_key"]
@@ -138,6 +140,17 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
                 continue
             time.sleep(0.5)
 
+        if city_key not in ensemble_cache:
+            ens_data = fetch_ensemble_daily_maxes(
+                lat=city_info["lat"], lon=city_info["lon"],
+                unit=city_info["unit"], forecast_days=DAYS_AHEAD,
+            )
+            if ens_data:
+                ensemble_cache[city_key] = ens_data
+                logger.info("ENSEMBLE: %s loaded %d members", city_info["name"],
+                            len(next(iter(ens_data.values()), [])))
+            time.sleep(0.3)
+
         forecast_data = forecast_cache.get(city_key)
         if not forecast_data:
             continue
@@ -150,10 +163,15 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
         unit_label = "\u00b0F" if city_info["unit"] == "fahrenheit" else "\u00b0C"
         logger.info("TEMP: %s %s -> max %.1f%s", city_info["name"], date_str, forecast_max, unit_label)
 
+        ens_temps_for_date = None
+        if city_key in ensemble_cache:
+            ens_temps_for_date = ensemble_cache[city_key].get(date_str)
+
         opps = analyze_temperature_event(
             event=ev, hourly_temps=hourly_temps,
             forecast_max=forecast_max,
             edge_threshold=EDGE_THRESHOLD, min_liquidity=MIN_LIQUIDITY,
+            ensemble_temps=ens_temps_for_date,
         )
         all_opportunities.extend(opps)
 

@@ -7,6 +7,9 @@ import requests
 
 from config import OPEN_METEO_URL, FORECAST_DAYS
 
+ENSEMBLE_API_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+ENSEMBLE_MODELS = ["gfs_seamless", "icon_seamless", "ecmwf_ifs025"]
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,13 +146,79 @@ def is_exact_bucket(bucket_low: "Optional[float]", bucket_high: "Optional[float]
         return True
     return False
 
+def fetch_ensemble_daily_maxes(
+    lat: float,
+    lon: float,
+    unit: str,
+    forecast_days: int = FORECAST_DAYS,
+) -> Optional[dict[str, list[float]]]:
+    all_member_maxes: dict[str, list[float]] = {}
+    tu = "fahrenheit" if unit == "fahrenheit" else "celsius"
+    for model in ENSEMBLE_MODELS:
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "daily": "temperature_2m_max",
+            "temperature_unit": tu,
+            "timezone": "auto",
+            "forecast_days": forecast_days,
+            "models": model,
+        }
+        try:
+            resp = requests.get(ENSEMBLE_API_URL, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            dates = data.get("daily", {}).get("time", [])
+            daily = data.get("daily", {})
+            for key in daily:
+                if not key.startswith("temperature_2m_max"):
+                    continue
+                vals = daily[key]
+                if not isinstance(vals, list):
+                    continue
+                for i, d in enumerate(dates):
+                    if i < len(vals) and vals[i] is not None:
+                        all_member_maxes.setdefault(d, []).append(vals[i])
+        except requests.RequestException as exc:
+            logger.warning("Ensemble %s failed: %s", model, exc)
+    if not all_member_maxes:
+        return None
+    return all_member_maxes
+
+
+def estimate_bucket_probability_ensemble(
+    ensemble_temps: list[float],
+    bucket_low: Optional[float],
+    bucket_high: Optional[float],
+) -> float:
+    if not ensemble_temps:
+        return 0.0
+    hits = 0
+    for temp in ensemble_temps:
+        rounded = round(temp)
+        in_bucket = True
+        if bucket_low is not None and rounded < bucket_low:
+            in_bucket = False
+        if bucket_high is not None and rounded > bucket_high:
+            in_bucket = False
+        if in_bucket:
+            hits += 1
+    return hits / len(ensemble_temps)
+
+
 def estimate_bucket_probability(
     hourly_temps: list[float],
     bucket_low: Optional[float],
     bucket_high: Optional[float],
     std_dev: float = 2.0,
     n_simulations: int = 5000,
+    ensemble_temps: Optional[list[float]] = None,
 ) -> float:
+    if ensemble_temps:
+        return estimate_bucket_probability_ensemble(
+            ensemble_temps, bucket_low, bucket_high
+        )
+
     if not hourly_temps:
         return 0.0
 
