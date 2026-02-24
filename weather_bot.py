@@ -14,6 +14,7 @@ from weather_forecast import (
     fetch_ensemble_daily_maxes,
     get_daily_max_from_hourly,
     get_hourly_temps_for_day,
+    RateLimitError,
 )
 from polymarket_api import discover_all_weather_events
 from opportunity_detector import (
@@ -109,6 +110,7 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
     resolved_cache: dict[str, bool] = {}
     forecast_cache: dict[str, dict] = {}
     ensemble_cache: dict[str, dict[str, list[float]]] = {}
+    ensemble_rate_limited = False
 
     for ev in temp_events:
         city_key = ev["city_key"]
@@ -142,7 +144,7 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
                 continue
             time.sleep(0.5)
 
-        if city_key not in ensemble_cache:
+        if city_key not in ensemble_cache and not ensemble_rate_limited:
             now_ts = time.time()
             cached = _ensemble_global_cache.get(city_key)
             if cached and (now_ts - cached[0]) < ENSEMBLE_CACHE_TTL:
@@ -150,16 +152,22 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
                 logger.info("ENSEMBLE: %s using cached data (age %ds)",
                             city_info["name"], int(now_ts - cached[0]))
             else:
-                ens_data = fetch_ensemble_daily_maxes(
-                    lat=city_info["lat"], lon=city_info["lon"],
-                    unit=city_info["unit"], forecast_days=DAYS_AHEAD,
-                )
-                if ens_data:
-                    ensemble_cache[city_key] = ens_data
-                    _ensemble_global_cache[city_key] = (now_ts, ens_data)
-                    logger.info("ENSEMBLE: %s loaded %d members (fresh)",
-                                city_info["name"],
-                                len(next(iter(ens_data.values()), [])))
+                try:
+                    ens_data = fetch_ensemble_daily_maxes(
+                        lat=city_info["lat"], lon=city_info["lon"],
+                        unit=city_info["unit"], forecast_days=DAYS_AHEAD,
+                    )
+                    if ens_data:
+                        ensemble_cache[city_key] = ens_data
+                        _ensemble_global_cache[city_key] = (now_ts, ens_data)
+                        logger.info("ENSEMBLE: %s loaded %d members (fresh)",
+                                    city_info["name"],
+                                    len(next(iter(ens_data.values()), [])))
+                    time.sleep(2)
+                except RateLimitError:
+                    ensemble_rate_limited = True
+                    logger.warning("CIRCUIT BREAKER: ensemble API rate limited, "
+                                   "skipping remaining cities this scan")
 
         forecast_data = forecast_cache.get(city_key)
         if not forecast_data:

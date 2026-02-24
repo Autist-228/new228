@@ -146,24 +146,32 @@ def is_exact_bucket(bucket_low: "Optional[float]", bucket_high: "Optional[float]
         return True
     return False
 
+class RateLimitError(Exception):
+    pass
+
+
 def _request_with_retry(
     url: str,
     params: dict,
     max_retries: int = 3,
-    base_delay: float = 5.0,
+    base_delay: float = 10.0,
 ) -> Optional[requests.Response]:
     for attempt in range(max_retries):
         try:
             resp = requests.get(url, params=params, timeout=15)
             if resp.status_code == 429:
-                delay = base_delay * (2 ** attempt)
-                logger.info("Rate limited (429), waiting %.0fs before retry %d/%d",
-                            delay, attempt + 1, max_retries)
-                time.sleep(delay)
-                continue
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.info("Rate limited (429), waiting %.0fs before retry %d/%d",
+                                delay, attempt + 1, max_retries)
+                    time.sleep(delay)
+                    continue
+                raise RateLimitError("429 after all retries")
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:
+            if isinstance(exc, RateLimitError):
+                raise
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
                 logger.warning("Request failed (%s), retry %d/%d in %.0fs",
@@ -192,7 +200,7 @@ def fetch_ensemble_daily_maxes(
         "models": ",".join(ENSEMBLE_MODELS),
     }
     try:
-        resp = _request_with_retry(ENSEMBLE_API_URL, params, max_retries=4,
+        resp = _request_with_retry(ENSEMBLE_API_URL, params, max_retries=3,
                                    base_delay=10.0)
         if resp is None:
             logger.warning("Ensemble: all retries exhausted for %s,%s", lat, lon)
@@ -209,6 +217,8 @@ def fetch_ensemble_daily_maxes(
             for i, d in enumerate(dates):
                 if i < len(vals) and vals[i] is not None:
                     all_member_maxes.setdefault(d, []).append(vals[i])
+    except RateLimitError:
+        raise
     except requests.RequestException as exc:
         logger.warning("Ensemble failed for %s,%s: %s", lat, lon, exc)
     if not all_member_maxes:
