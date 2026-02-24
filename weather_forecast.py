@@ -182,37 +182,35 @@ def fetch_ensemble_daily_maxes(
 ) -> Optional[dict[str, list[float]]]:
     all_member_maxes: dict[str, list[float]] = {}
     tu = "fahrenheit" if unit == "fahrenheit" else "celsius"
-    for model in ENSEMBLE_MODELS:
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "daily": "temperature_2m_max",
-            "temperature_unit": tu,
-            "timezone": "auto",
-            "forecast_days": forecast_days,
-            "models": model,
-        }
-        try:
-            resp = _request_with_retry(ENSEMBLE_API_URL, params)
-            if resp is None:
-                logger.warning("Ensemble %s: all retries exhausted", model)
-                time.sleep(3)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max",
+        "temperature_unit": tu,
+        "timezone": "auto",
+        "forecast_days": forecast_days,
+        "models": ",".join(ENSEMBLE_MODELS),
+    }
+    try:
+        resp = _request_with_retry(ENSEMBLE_API_URL, params, max_retries=4,
+                                   base_delay=10.0)
+        if resp is None:
+            logger.warning("Ensemble: all retries exhausted for %s,%s", lat, lon)
+            return None
+        data = resp.json()
+        dates = data.get("daily", {}).get("time", [])
+        daily = data.get("daily", {})
+        for key in daily:
+            if not key.startswith("temperature_2m_max"):
                 continue
-            data = resp.json()
-            dates = data.get("daily", {}).get("time", [])
-            daily = data.get("daily", {})
-            for key in daily:
-                if not key.startswith("temperature_2m_max"):
-                    continue
-                vals = daily[key]
-                if not isinstance(vals, list):
-                    continue
-                for i, d in enumerate(dates):
-                    if i < len(vals) and vals[i] is not None:
-                        all_member_maxes.setdefault(d, []).append(vals[i])
-        except requests.RequestException as exc:
-            logger.warning("Ensemble %s failed: %s", model, exc)
-        time.sleep(3)
+            vals = daily[key]
+            if not isinstance(vals, list):
+                continue
+            for i, d in enumerate(dates):
+                if i < len(vals) and vals[i] is not None:
+                    all_member_maxes.setdefault(d, []).append(vals[i])
+    except requests.RequestException as exc:
+        logger.warning("Ensemble failed for %s,%s: %s", lat, lon, exc)
     if not all_member_maxes:
         return None
     return all_member_maxes
