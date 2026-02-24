@@ -146,6 +146,34 @@ def is_exact_bucket(bucket_low: "Optional[float]", bucket_high: "Optional[float]
         return True
     return False
 
+def _request_with_retry(
+    url: str,
+    params: dict,
+    max_retries: int = 3,
+    base_delay: float = 5.0,
+) -> Optional[requests.Response]:
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            if resp.status_code == 429:
+                delay = base_delay * (2 ** attempt)
+                logger.info("Rate limited (429), waiting %.0fs before retry %d/%d",
+                            delay, attempt + 1, max_retries)
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as exc:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning("Request failed (%s), retry %d/%d in %.0fs",
+                               exc, attempt + 1, max_retries, delay)
+                time.sleep(delay)
+            else:
+                raise
+    return None
+
+
 def fetch_ensemble_daily_maxes(
     lat: float,
     lon: float,
@@ -165,8 +193,11 @@ def fetch_ensemble_daily_maxes(
             "models": model,
         }
         try:
-            resp = requests.get(ENSEMBLE_API_URL, params=params, timeout=15)
-            resp.raise_for_status()
+            resp = _request_with_retry(ENSEMBLE_API_URL, params)
+            if resp is None:
+                logger.warning("Ensemble %s: all retries exhausted", model)
+                time.sleep(3)
+                continue
             data = resp.json()
             dates = data.get("daily", {}).get("time", [])
             daily = data.get("daily", {})
@@ -181,6 +212,7 @@ def fetch_ensemble_daily_maxes(
                         all_member_maxes.setdefault(d, []).append(vals[i])
         except requests.RequestException as exc:
             logger.warning("Ensemble %s failed: %s", model, exc)
+        time.sleep(3)
     if not all_member_maxes:
         return None
     return all_member_maxes

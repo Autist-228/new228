@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import (
     CITIES,
@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 SEPARATOR = "=" * 80
 DAYS_AHEAD = 2
+ENSEMBLE_CACHE_TTL = 1800
+_ensemble_global_cache: dict[str, tuple[float, dict[str, list[float]]]] = {}
 
 
 def run_resolve_cycle() -> list[dict]:
@@ -141,15 +143,23 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
             time.sleep(0.5)
 
         if city_key not in ensemble_cache:
-            ens_data = fetch_ensemble_daily_maxes(
-                lat=city_info["lat"], lon=city_info["lon"],
-                unit=city_info["unit"], forecast_days=DAYS_AHEAD,
-            )
-            if ens_data:
-                ensemble_cache[city_key] = ens_data
-                logger.info("ENSEMBLE: %s loaded %d members", city_info["name"],
-                            len(next(iter(ens_data.values()), [])))
-            time.sleep(0.3)
+            now_ts = time.time()
+            cached = _ensemble_global_cache.get(city_key)
+            if cached and (now_ts - cached[0]) < ENSEMBLE_CACHE_TTL:
+                ensemble_cache[city_key] = cached[1]
+                logger.info("ENSEMBLE: %s using cached data (age %ds)",
+                            city_info["name"], int(now_ts - cached[0]))
+            else:
+                ens_data = fetch_ensemble_daily_maxes(
+                    lat=city_info["lat"], lon=city_info["lon"],
+                    unit=city_info["unit"], forecast_days=DAYS_AHEAD,
+                )
+                if ens_data:
+                    ensemble_cache[city_key] = ens_data
+                    _ensemble_global_cache[city_key] = (now_ts, ens_data)
+                    logger.info("ENSEMBLE: %s loaded %d members (fresh)",
+                                city_info["name"],
+                                len(next(iter(ens_data.values()), [])))
 
         forecast_data = forecast_cache.get(city_key)
         if not forecast_data:
