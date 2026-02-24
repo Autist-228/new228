@@ -10,8 +10,8 @@ CITIES = {
     "london": {
         "name": "London",
         "slug_name": "london",
-        "lat": 51.4700,
-        "lon": -0.4543,
+        "lat": 51.5053,
+        "lon": 0.0553,
         "unit": "celsius",
         "timezone": "Europe/London",
     },
