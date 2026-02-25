@@ -536,6 +536,8 @@ def get_trader() -> Trader:
 
 
 def place_real_bet(portfolio: RealPortfolio, opp: dict, trader: Trader) -> Optional[dict]:
+    from config import SPREAD_BET_AMOUNT
+
     market_id = opp["market_id"]
     token_id = opp.get("yes_token_id", "")
 
@@ -552,17 +554,12 @@ def place_real_bet(portfolio: RealPortfolio, opp: dict, trader: Trader) -> Optio
         logger.warning("USDC too low: $%.2f", usdc_balance)
         return None
 
-    settings = load_settings()
-    max_usd = settings.get("max_bet_usd", 1.50)
-
-    edge = opp.get("edge", 0)
     yes_price = opp.get("market_yes_price", 0)
-
-    bet_amount = round(max_usd, 2)
-
-    if bet_amount < MIN_BET_USDC:
-        logger.warning("Bet too small: $%.2f", bet_amount)
+    if yes_price <= 0:
+        logger.warning("Invalid price for market %s", market_id)
         return None
+
+    bet_amount = SPREAD_BET_AMOUNT
 
     resp = trader.place_market_buy(token_id, yes_price, bet_amount)
     if resp is None:
@@ -595,7 +592,7 @@ def place_real_bet(portfolio: RealPortfolio, opp: dict, trader: Trader) -> Optio
         "yes_price": yes_price,
         "order_id": order_id,
         "forecast_probability": opp.get("forecast_probability", 0),
-        "edge": edge,
+        "edge": opp.get("edge", 0),
         "expected_value": opp.get("expected_value", 0),
         "forecast_value": opp.get("forecast_value", 0),
         "status": "active",
@@ -609,9 +606,9 @@ def place_real_bet(portfolio: RealPortfolio, opp: dict, trader: Trader) -> Optio
     portfolio.active_bets.append(bet_dict)
 
     logger.info(
-        "REAL BET: %s | %s %s | %s | %.0f sh @ $%.3f = $%.2f",
+        "SPREAD BET: %s | %s %s | %s | %.0f sh @ %.0fc = $%.2f",
         bet_id, bet_dict["city"], bet_dict["date"],
-        bet_dict["bucket_label"], shares, yes_price, bet_amount,
+        bet_dict["bucket_label"], shares, yes_price * 100, bet_amount,
     )
     return bet_dict
 

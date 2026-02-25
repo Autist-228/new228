@@ -1,17 +1,9 @@
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
-from config import EDGE_THRESHOLD, MIN_LIQUIDITY, LOTTERY_MIN_PRICE, LOTTERY_MAX_PRICE
-from weather_forecast import (
-    parse_bucket_range,
-    estimate_bucket_probability,
-    parse_precipitation_range,
-    estimate_precipitation_probability,
-)
-
-
-def is_wide_bucket(bucket_low, bucket_high) -> bool:
-    return bucket_low is None or bucket_high is None
+from config import SPREAD_MAX_PRICE, MIN_LIQUIDITY
+from weather_forecast import parse_bucket_range
 
 logger = logging.getLogger(__name__)
 
@@ -34,122 +26,113 @@ class Opportunity:
     yes_token_id: str = ""
 
 
-def analyze_temperature_event(
+def _bucket_center(
+    bucket_low: Optional[float], bucket_high: Optional[float],
+) -> Optional[float]:
+    if bucket_low is not None and bucket_high is not None:
+        return (bucket_low + bucket_high) / 2.0
+    if bucket_low is not None and bucket_high is None:
+        return bucket_low + 1.0
+    if bucket_low is None and bucket_high is not None:
+        return bucket_high - 1.0
+    return None
+
+
+def find_spread_bet_opportunities(
     event: dict,
-    hourly_temps: list[float],
     forecast_max: float,
-    edge_threshold: float = EDGE_THRESHOLD,
+    max_price: float = SPREAD_MAX_PRICE,
     min_liquidity: float = MIN_LIQUIDITY,
-    ensemble_temps: list[float] | None = None,
 ) -> list[Opportunity]:
-    opportunities: list[Opportunity] = []
     markets = event.get("markets", [])
 
+    parsed = []
     for m in markets:
         if m.get("closed", False) or not m.get("active", True):
             continue
-
         label = m.get("bucket_label", "")
         yes_price = m.get("yes_price", 0.0)
         liquidity = m.get("liquidity", 0)
+        token_id = m.get("yes_token_id", "")
+        if not token_id:
+            continue
 
         bucket_low, bucket_high = parse_bucket_range(label)
         if bucket_low is None and bucket_high is None:
             continue
 
-        if yes_price < LOTTERY_MIN_PRICE or yes_price > LOTTERY_MAX_PRICE:
+        center = _bucket_center(bucket_low, bucket_high)
+        if center is None:
             continue
 
-        forecast_prob = estimate_bucket_probability(
-            hourly_temps, bucket_low, bucket_high,
-            ensemble_temps=ensemble_temps,
+        parsed.append({
+            "market": m,
+            "label": label,
+            "yes_price": yes_price,
+            "liquidity": liquidity,
+            "bucket_low": bucket_low,
+            "bucket_high": bucket_high,
+            "center": center,
+            "token_id": token_id,
+        })
+
+    if not parsed:
+        return []
+
+    parsed.sort(key=lambda x: x["center"])
+
+    forecast_rounded = round(forecast_max)
+    best_idx = None
+    best_dist = float("inf")
+    for i, p in enumerate(parsed):
+        dist = abs(p["center"] - forecast_rounded)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = i
+
+    if best_idx is None:
+        return []
+
+    spread_indices = []
+    if best_idx > 0:
+        spread_indices.append(best_idx - 1)
+    spread_indices.append(best_idx)
+    if best_idx < len(parsed) - 1:
+        spread_indices.append(best_idx + 1)
+
+    opportunities = []
+    for idx in spread_indices:
+        p = parsed[idx]
+        if p["yes_price"] < 0.01 or p["yes_price"] > max_price:
+            continue
+        if p["liquidity"] < min_liquidity:
+            continue
+
+        opp = Opportunity(
+            event_type="temperature",
+            city=event.get("city_name", ""),
+            date=event.get("date", ""),
+            bucket_label=p["label"],
+            market_yes_price=p["yes_price"],
+            forecast_probability=0.0,
+            edge=0.0,
+            expected_value=0.0,
+            forecast_value=forecast_max,
+            liquidity=p["liquidity"],
+            market_id=p["market"]["id"],
+            market_slug=p["market"].get("slug", ""),
+            event_title=event.get("title", ""),
+            yes_token_id=p["token_id"],
         )
+        opportunities.append(opp)
 
-        edge = forecast_prob - yes_price
-
-        if yes_price > 0:
-            ev = (forecast_prob * (1.0 - yes_price)) - ((1.0 - forecast_prob) * yes_price)
-        else:
-            ev = 0.0
-
-        if edge >= edge_threshold and liquidity >= min_liquidity:
-            opp = Opportunity(
-                event_type="temperature",
-                city=event.get("city_name", ""),
-                date=event.get("date", ""),
-                bucket_label=label,
-                market_yes_price=yes_price,
-                forecast_probability=forecast_prob,
-                edge=edge,
-                expected_value=ev,
-                forecast_value=forecast_max,
-                liquidity=liquidity,
-                market_id=m.get("id", ""),
-                market_slug=m.get("slug", ""),
-                event_title=event.get("title", ""),
-                yes_token_id=m.get("yes_token_id", ""),
-            )
-            opportunities.append(opp)
-            logger.info(
-                "LOTTERY OPP: %s %s | %s @ %.1f¢ | fcst=%.0f%% edge=+%.0f%% | x%.0f",
-                event.get("city_name", ""), event.get("date", ""),
-                label, yes_price * 100, forecast_prob * 100, edge * 100,
-                1.0 / yes_price if yes_price > 0 else 0,
-            )
-
-    return opportunities
-
-
-def analyze_precipitation_event(
-    event: dict,
-    forecast_total: float,
-    edge_threshold: float = EDGE_THRESHOLD,
-    min_liquidity: float = MIN_LIQUIDITY,
-) -> list[Opportunity]:
-    opportunities: list[Opportunity] = []
-    markets = event.get("markets", [])
-
-    for m in markets:
-        if m.get("closed", False) or not m.get("active", True):
-            continue
-
-        question = m.get("question", "")
-        yes_price = m.get("yes_price", 0.0)
-        liquidity = m.get("liquidity", 0)
-
-        bucket_low, bucket_high = parse_precipitation_range(question)
-        if bucket_low is None and bucket_high is None:
-            continue
-
-        forecast_prob = estimate_precipitation_probability(
-            forecast_total, bucket_low, bucket_high
+    if opportunities:
+        labels = ", ".join(o.bucket_label for o in opportunities)
+        prices = ", ".join(f"{o.market_yes_price*100:.0f}c" for o in opportunities)
+        logger.info(
+            "SPREAD BET: %s %s | forecast=%.1f | buckets=[%s] prices=[%s]",
+            event.get("city_name", ""), event.get("date", ""),
+            forecast_max, labels, prices,
         )
-
-        edge = forecast_prob - yes_price
-
-        if yes_price > 0:
-            ev = (forecast_prob * (1.0 - yes_price)) - ((1.0 - forecast_prob) * yes_price)
-        else:
-            ev = 0.0
-
-        if edge >= edge_threshold and liquidity >= min_liquidity and yes_price > 0.01:
-            label = m.get("bucket_label", "") or question
-            opp = Opportunity(
-                event_type="precipitation",
-                city=event.get("city_name", ""),
-                date=event.get("date", ""),
-                bucket_label=label,
-                market_yes_price=yes_price,
-                forecast_probability=forecast_prob,
-                edge=edge,
-                expected_value=ev,
-                forecast_value=forecast_total,
-                liquidity=liquidity,
-                market_id=m.get("id", ""),
-                market_slug=m.get("slug", ""),
-                event_title=event.get("title", ""),
-                yes_token_id=m.get("yes_token_id", ""),
-            )
-            opportunities.append(opp)
 
     return opportunities

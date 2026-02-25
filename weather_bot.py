@@ -1,24 +1,20 @@
 import logging
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from config import (
     CITIES,
-    EDGE_THRESHOLD,
-    MIN_LIQUIDITY,
     SCAN_INTERVAL_SECONDS,
+    SPREAD_BET_AMOUNT,
 )
 from weather_forecast import (
     fetch_hourly_forecast,
-    fetch_ensemble_daily_maxes,
     get_daily_max_from_hourly,
-    get_hourly_temps_for_day,
-    RateLimitError,
 )
 from polymarket_api import discover_all_weather_events
 from opportunity_detector import (
-    analyze_temperature_event,
+    find_spread_bet_opportunities,
     Opportunity,
 )
 from real_trader import (
@@ -28,7 +24,6 @@ from real_trader import (
     get_portfolio_summary,
     resolve_bet,
     get_trader,
-    MAX_BETS_PER_SCAN,
 )
 from bet_resolver import try_resolve_bet, fetch_actual_max_temperature
 from token_redeemer import redeem_winning_tokens
@@ -42,8 +37,6 @@ logger = logging.getLogger(__name__)
 
 SEPARATOR = "=" * 80
 DAYS_AHEAD = 2
-ENSEMBLE_CACHE_TTL = 1800
-_ensemble_global_cache: dict[str, tuple[float, dict[str, list[float]]]] = {}
 
 
 def run_resolve_cycle() -> list[dict]:
@@ -109,8 +102,6 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
     today_date = datetime.now(timezone.utc).date()
     resolved_cache: dict[str, bool] = {}
     forecast_cache: dict[str, dict] = {}
-    ensemble_cache: dict[str, dict[str, list[float]]] = {}
-    ensemble_rate_limited = False
 
     for ev in temp_events:
         city_key = ev["city_key"]
@@ -144,57 +135,25 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
                 continue
             time.sleep(0.5)
 
-        if city_key not in ensemble_cache and not ensemble_rate_limited:
-            now_ts = time.time()
-            cached = _ensemble_global_cache.get(city_key)
-            if cached and (now_ts - cached[0]) < ENSEMBLE_CACHE_TTL:
-                ensemble_cache[city_key] = cached[1]
-                logger.info("ENSEMBLE: %s using cached data (age %ds)",
-                            city_info["name"], int(now_ts - cached[0]))
-            else:
-                try:
-                    ens_data = fetch_ensemble_daily_maxes(
-                        lat=city_info["lat"], lon=city_info["lon"],
-                        unit=city_info["unit"], forecast_days=DAYS_AHEAD,
-                    )
-                    if ens_data:
-                        ensemble_cache[city_key] = ens_data
-                        _ensemble_global_cache[city_key] = (now_ts, ens_data)
-                        logger.info("ENSEMBLE: %s loaded %d members (fresh)",
-                                    city_info["name"],
-                                    len(next(iter(ens_data.values()), [])))
-                    time.sleep(2)
-                except RateLimitError:
-                    ensemble_rate_limited = True
-                    logger.warning("CIRCUIT BREAKER: ensemble API rate limited, "
-                                   "skipping remaining cities this scan")
-
         forecast_data = forecast_cache.get(city_key)
         if not forecast_data:
             continue
 
-        hourly_temps = get_hourly_temps_for_day(forecast_data, date_str)
         forecast_max = get_daily_max_from_hourly(forecast_data, date_str)
-        if not hourly_temps or forecast_max is None:
+        if forecast_max is None:
             continue
 
         unit_label = "\u00b0F" if city_info["unit"] == "fahrenheit" else "\u00b0C"
         logger.info("TEMP: %s %s -> max %.1f%s", city_info["name"], date_str, forecast_max, unit_label)
 
-        ens_temps_for_date = None
-        if city_key in ensemble_cache:
-            ens_temps_for_date = ensemble_cache[city_key].get(date_str)
-
-        opps = analyze_temperature_event(
-            event=ev, hourly_temps=hourly_temps,
+        opps = find_spread_bet_opportunities(
+            event=ev,
             forecast_max=forecast_max,
-            edge_threshold=EDGE_THRESHOLD, min_liquidity=MIN_LIQUIDITY,
-            ensemble_temps=ens_temps_for_date,
         )
         all_opportunities.extend(opps)
 
     if not all_opportunities:
-        logger.info("No opportunities with edge >= %.0f%%", EDGE_THRESHOLD * 100)
+        logger.info("No spread bet opportunities found")
         portfolio = load_portfolio()
         portfolio.last_scan = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         save_portfolio(portfolio)
@@ -203,12 +162,12 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
     now_utc = datetime.now(timezone.utc)
     today_str = now_utc.strftime("%Y-%m-%d")
 
-    all_opportunities.sort(key=lambda o: (0 if o.date == today_str else 1, -o.edge))
+    all_opportunities.sort(key=lambda o: (0 if o.date == today_str else 1, o.market_yes_price))
     today_count = sum(1 for o in all_opportunities if o.date == today_str)
     tomorrow_count = len(all_opportunities) - today_count
 
     logger.info(
-        "Found %d opps (today: %d, tmrw: %d)",
+        "SPREAD BET: %d bucket opps (today: %d, tmrw: %d)",
         len(all_opportunities), today_count, tomorrow_count,
     )
 
@@ -218,8 +177,6 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
     portfolio = load_portfolio()
     bets_placed: list[dict] = []
     for opp in all_opportunities:
-        if len(bets_placed) >= MAX_BETS_PER_SCAN:
-            break
         opp_dict = asdict(opp)
         bet = place_real_bet(portfolio, opp_dict, trader)
         if bet:
@@ -229,24 +186,23 @@ def run_scan() -> tuple[list[Opportunity], list[dict]]:
     portfolio.last_scan = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     save_portfolio(portfolio)
 
-    for i, opp in enumerate(all_opportunities[:10], 1):
+    for i, opp in enumerate(all_opportunities[:15], 1):
         logger.info(
-            "  #%d [%s] %s %s | %s | edge=+%.1f%% | mkt=%.1f%% fcst=%.1f%%",
-            i, opp.event_type.upper(), opp.city, opp.date,
-            opp.bucket_label, opp.edge * 100,
-            opp.market_yes_price * 100, opp.forecast_probability * 100,
+            "  #%d %s %s | %s @ %.0f¢",
+            i, opp.city, opp.date,
+            opp.bucket_label, opp.market_yes_price * 100,
         )
 
     logger.info(SEPARATOR)
-    logger.info("SCAN DONE | Opps: %d | Bets: %d", len(all_opportunities), len(bets_placed))
+    logger.info("SCAN DONE | Spread opps: %d | Bets placed: %d", len(all_opportunities), len(bets_placed))
     logger.info(get_portfolio_summary(portfolio))
     logger.info(SEPARATOR)
     return all_opportunities, bets_placed
 
 
 def main() -> None:
-    logger.info("Starting Polymarket Weather Bot - REAL MONEY")
-    logger.info("Edge: %.0f%% | Scan: %ds", EDGE_THRESHOLD * 100, SCAN_INTERVAL_SECONDS)
+    logger.info("Starting Polymarket Weather Bot - SPREAD BET STRATEGY")
+    logger.info("Bet: $%.2f/bucket | Max price: 20c | Scan: %ds", SPREAD_BET_AMOUNT, SCAN_INTERVAL_SECONDS)
     logger.info("Cities: %s", ", ".join(c["name"] for c in CITIES.values()))
     while True:
         try:
