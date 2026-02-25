@@ -43,6 +43,7 @@ def find_spread_bet_opportunities(
     forecast_max: float,
     max_price: float = SPREAD_MAX_PRICE,
     min_liquidity: float = MIN_LIQUIDITY,
+    num_buckets: int = 3,
 ) -> list[Opportunity]:
     markets = event.get("markets", [])
 
@@ -79,35 +80,24 @@ def find_spread_bet_opportunities(
     if not parsed:
         return []
 
-    parsed.sort(key=lambda x: x["center"])
-
     forecast_rounded = round(forecast_max)
-    best_idx = None
-    best_dist = float("inf")
-    for i, p in enumerate(parsed):
-        dist = abs(p["center"] - forecast_rounded)
-        if dist < best_dist:
-            best_dist = dist
-            best_idx = i
 
-    if best_idx is None:
+    cheap = [
+        p for p in parsed
+        if 0.01 <= p["yes_price"] <= max_price and p["liquidity"] >= min_liquidity
+    ]
+
+    if not cheap:
         return []
 
-    spread_indices = []
-    if best_idx > 0:
-        spread_indices.append(best_idx - 1)
-    spread_indices.append(best_idx)
-    if best_idx < len(parsed) - 1:
-        spread_indices.append(best_idx + 1)
+    cheap.sort(key=lambda p: abs(p["center"] - forecast_rounded))
+
+    selected = cheap[:num_buckets]
+
+    selected.sort(key=lambda p: p["center"])
 
     opportunities = []
-    for idx in spread_indices:
-        p = parsed[idx]
-        if p["yes_price"] < 0.01 or p["yes_price"] > max_price:
-            continue
-        if p["liquidity"] < min_liquidity:
-            continue
-
+    for p in selected:
         opp = Opportunity(
             event_type="temperature",
             city=event.get("city_name", ""),
