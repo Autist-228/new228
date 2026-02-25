@@ -57,9 +57,6 @@ def analyze_temperature_event(
         if bucket_low is None and bucket_high is None:
             continue
 
-        if not is_wide_bucket(bucket_low, bucket_high):
-            continue
-
         if yes_price < LOTTERY_MIN_PRICE or yes_price > LOTTERY_MAX_PRICE:
             continue
 
