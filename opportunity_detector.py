@@ -9,6 +9,10 @@ from weather_forecast import (
     estimate_precipitation_probability,
 )
 
+
+def is_wide_bucket(bucket_low, bucket_high) -> bool:
+    return bucket_low is None or bucket_high is None
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,6 +55,9 @@ def analyze_temperature_event(
 
         bucket_low, bucket_high = parse_bucket_range(label)
         if bucket_low is None and bucket_high is None:
+            continue
+
+        if not is_wide_bucket(bucket_low, bucket_high):
             continue
 
         if yes_price < LOTTERY_MIN_PRICE or yes_price > LOTTERY_MAX_PRICE:
